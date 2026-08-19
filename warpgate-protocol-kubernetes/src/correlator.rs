@@ -5,14 +5,23 @@ use std::time::{Duration, Instant};
 use poem::Request;
 use tokio::sync::Mutex;
 use warpgate_common::auth::{AuthResult, AuthStateUserInfo};
-use warpgate_common::{SessionId, User, WarpgateError};
+use warpgate_common::{SessionId, WarpgateError};
 use warpgate_common_http::logging::get_client_ip;
-use warpgate_core::{Services, SessionStateInit, State, TargetAuthorization, WarpgateServerHandle};
+use warpgate_core::{Services, SessionStateInit, State, WarpgateServerHandle};
 
-use crate::server::auth::{authorize_kubernetes_target, unauthorized};
+use crate::server::auth::{
+    KubernetesAuthentication, KubernetesTargetAuthorization, authorize_kubernetes_target,
+    unauthorized,
+};
 use crate::session_handle::KubernetesSessionHandle;
 
-type CorrelationKey = (String, String, Option<String>); // (username, target_name, ip)
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CorrelationKey {
+    username: String,
+    target_name: String,
+    client_ip: Option<String>,
+    authentication_source: String,
+}
 
 /// The outcome of the request that opened one correlated session. Requests that
 /// join a session in flight wait on the mutex, so a `kubectl` command's fan-out
@@ -24,7 +33,7 @@ enum Authorization {
     /// opening request that was dropped mid-approval.
     #[default]
     Pending,
-    Authorized(TargetAuthorization),
+    Authorized(KubernetesTargetAuthorization),
     Denied,
 }
 
@@ -55,12 +64,22 @@ pub struct RequestCorrelator {
 pub async fn correlated_authorization(
     correlator: &Arc<Mutex<RequestCorrelator>>,
     request: &Request,
-    user: &User,
+    authentication: &KubernetesAuthentication,
     target_name: &str,
     services: &Services,
-) -> poem::Result<(Arc<Mutex<WarpgateServerHandle>>, TargetAuthorization)> {
-    let user_info: AuthStateUserInfo = user.into();
-    let key = correlation_key_for_request(request, services, &user_info, target_name).await?;
+) -> poem::Result<(
+    Arc<Mutex<WarpgateServerHandle>>,
+    KubernetesTargetAuthorization,
+)> {
+    let user_info = authentication.user_info();
+    let key = correlation_key_for_request(
+        request,
+        services,
+        &user_info,
+        target_name,
+        authentication.authentication_source(),
+    )
+    .await?;
 
     loop {
         // Bound to its own `let` so the correlator lock is released before
@@ -105,8 +124,14 @@ pub async fn correlated_authorization(
             continue;
         };
 
-        return match authorize_kubernetes_target(request, user, target_name, session_id, services)
-            .await
+        return match authorize_kubernetes_target(
+            request,
+            authentication,
+            target_name,
+            session_id,
+            services,
+        )
+        .await
         {
             Ok(resolved) => {
                 handle.lock().await.confirm();
@@ -139,7 +164,12 @@ async fn join_session(
     handle: Arc<Mutex<WarpgateServerHandle>>,
     slot: SharedAuthorization,
     services: &Services,
-) -> poem::Result<Option<(Arc<Mutex<WarpgateServerHandle>>, TargetAuthorization)>> {
+) -> poem::Result<
+    Option<(
+        Arc<Mutex<WarpgateServerHandle>>,
+        KubernetesTargetAuthorization,
+    )>,
+> {
     // Cloned out so the slot lock is not held while taking the correlator lock.
     let outcome = slot.lock().await.clone();
     match outcome {
@@ -217,9 +247,15 @@ async fn correlation_key_for_request(
     services: &Services,
     user_info: &AuthStateUserInfo,
     target_name: &str,
+    authentication_source: &str,
 ) -> Result<CorrelationKey, WarpgateError> {
     let ip = get_client_ip(request, services).await;
-    Ok((user_info.username.clone(), target_name.into(), ip))
+    Ok(CorrelationKey {
+        username: user_info.username.clone(),
+        target_name: target_name.into(),
+        client_ip: ip,
+        authentication_source: authentication_source.into(),
+    })
 }
 
 impl RequestCorrelator {

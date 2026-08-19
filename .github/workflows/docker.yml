@@ -11,7 +11,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: warp-tech/warpgate
+  # Forks publish under their own owner, without requiring write access to the
+  # upstream GHCR namespace.
+  IMAGE_NAME: ${{ github.repository }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
