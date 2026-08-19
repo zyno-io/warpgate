@@ -88,10 +88,23 @@ pub async fn handle_api_request(
     // account status). Authorization — the credential policy / web approval — is
     // resolved once per correlated session and reused, so a single `kubectl`
     // command's fan-out of requests only prompts for approval once.
-    let user = authenticate_kubernetes_user(req, ctx.services()).await?;
+    let authentication = authenticate_kubernetes_user(req, ctx.services()).await?;
 
-    let (handle, authorization) =
-        correlated_authorization(correlator.0, req, &user, &target_name, ctx.services()).await?;
+    let (handle, authorization) = correlated_authorization(
+        correlator.0,
+        req,
+        &authentication,
+        &target_name,
+        ctx.services(),
+    )
+    .await?;
+
+    // OIDC-backed JIT tickets are server-side grants.  Recheck them here,
+    // after correlation but before the request is forwarded, so expiry or
+    // revocation is effective for every Kubernetes API request.
+    authorization
+        .verify_current(&authentication, ctx.services())
+        .await?;
 
     let (user_info, target) = authorization.into_parts();
 

@@ -414,15 +414,17 @@ impl ConfigProvider for DatabaseConfigProvider {
                 protocols: HashMap::new(),
             };
 
-            // Only HTTP performs an SSO exchange inline; no other protocol can
-            // carry one on the wire, so there a required `Sso` is satisfied by
-            // the in-browser approval flow instead. Keyed off the protocol
-            // rather than a per-entry flag so the rule has one statement.
+            // HTTP and Kubernetes can both carry a verified OIDC ID token. For
+            // the remaining protocols, a required `Sso` is satisfied by the
+            // in-browser approval flow instead. Keyed off the protocol rather
+            // than a per-entry flag so the rule has one statement.
             let make_policy = |protocol: Protocol, required: Vec<CredentialKind>| {
                 let required_credential_types = required
                     .into_iter()
                     .map(|kind| match (kind, protocol) {
-                        (CredentialKind::Sso, Protocol::Http) => CredentialKind::Sso,
+                        (CredentialKind::Sso, Protocol::Http | Protocol::Kubernetes) => {
+                            CredentialKind::Sso
+                        }
                         (CredentialKind::Sso, _) => CredentialKind::WebUserApproval,
                         (kind, _) => kind,
                     })

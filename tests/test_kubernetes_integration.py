@@ -29,6 +29,42 @@ def run_kubectl(args, **kwargs):
     )
 
 
+def ticket_request_parameters(**overrides):
+    """Build the complete ticket policy update used by JIT integration tests."""
+    defaults = dict(
+        allow_own_credential_management=True,
+        minimize_password_login=False,
+        rate_limit_bytes_per_second=None,
+        ssh_client_auth_keyboard_interactive=True,
+        ssh_client_auth_password=True,
+        ssh_client_auth_publickey=True,
+        ticket_self_service_enabled=True,
+        ticket_auto_approve_existing_access=False,
+        ticket_require_description=True,
+        ticket_request_show_all_targets=True,
+    )
+    defaults.update(overrides)
+    return sdk.ParameterUpdate(**defaults)
+
+
+def create_api_token(base_url, username, password):
+    """Create a normal Warpgate API token for listener-auth tests."""
+    session = requests.Session()
+    session.verify = False
+    login = session.post(
+        f"{base_url}/@warpgate/api/auth/login",
+        json={"username": username, "password": password},
+    )
+    login.raise_for_status()
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    response = session.post(
+        f"{base_url}/@warpgate/api/profile/api-tokens",
+        json={"label": "kubernetes-auth-test", "expiry": expiry},
+    )
+    response.raise_for_status()
+    return response.json()["secret"]
+
+
 # ---------------------------------------------------------------------------
 # OIDC helpers
 # ---------------------------------------------------------------------------
@@ -1091,17 +1127,16 @@ class TestKubernetesIntegration:
         """
         k3s = processes.start_k3s()
 
-        wg = processes.start_wg(
-            config_patch={
-                "sso_providers": [
-                    _make_oidc_sso_provider_config(
-                        oidc_port,
-                        auto_create_users=True,
-                        role_mappings=role_mappings,
-                    )
-                ],
-            },
-        )
+        config_patch = {
+            "sso_providers": [
+                _make_oidc_sso_provider_config(
+                    oidc_port,
+                    auto_create_users=True,
+                    role_mappings=role_mappings,
+                )
+            ],
+        }
+        wg = processes.start_wg(config_patch=config_patch)
         wait_port(wg.http_port, for_process=wg.process, recv=False)
         url = f"https://localhost:{wg.http_port}"
 
@@ -1236,6 +1271,191 @@ class TestKubernetesIntegration:
         assert resp.status_code == 403, (
             f"expected 403, got {resp.status_code}: {resp.text[:300]}"
         )
+
+    @pytest.mark.asyncio
+    async def test_kubectl_oidc_self_service_ticket_grant(
+        self, processes: ProcessManager
+    ):
+        """An active ticket grants only its user's OIDC identity access.
+
+        The Kubernetes client presents an OIDC ID token. Activation retains the
+        existing ticket secret response, while the additional server-side grant
+        authorizes the OIDC identity until revocation. Overlapping active
+        tickets collectively constitute that grant: revoking one leaves access
+        in place until the last is revoked, even when the request correlation is
+        cached.
+        """
+        target_role = f"k8s-oidc-role-{uuid.uuid4()}"
+        oidc_port, redirect_uri = self._start_oidc_mock_for_roles(processes, [])
+        wg, target_name, _k3s = self._start_wg_and_k3s_target(
+            processes,
+            oidc_port=oidc_port,
+            role_mappings={},
+            target_role_name=target_role,
+        )
+        url = f"https://localhost:{wg.http_port}"
+
+        # Pre-create the OIDC subject with a password only to drive the ticket
+        # request API in this test. It intentionally receives no target role.
+        with admin_client(url) as api:
+            user = api.create_user(
+                sdk.CreateUserRequest(username=f"user-{uuid.uuid4()}")
+            )
+            api.create_password_credential(
+                user.id, sdk.NewPasswordCredential(password="123")
+            )
+            api.create_sso_credential(
+                user.id,
+                sdk.NewSsoCredential(
+                    email="sam.tailor@gmail.com",
+                    provider="test-oidc",
+                ),
+            )
+            api.update_user(
+                user.id,
+                sdk.UserDataRequest(
+                    username=user.username,
+                    credential_policy=sdk.UserRequireCredentialsPolicy(
+                        kubernetes=[sdk.CredentialKind.SSO],
+                    ),
+                ),
+            )
+            api.update_parameters(ticket_request_parameters())
+
+        ticket_session = requests.Session()
+        ticket_session.verify = False
+        login = ticket_session.post(
+            f"{url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "123"},
+        )
+        assert login.status_code // 100 == 2
+        request = ticket_session.post(
+            f"{url}/@warpgate/api/ticket-requests",
+            json={
+                "target_name": target_name,
+                "duration_seconds": 3600,
+                "description": "test OIDC JIT grant",
+            },
+        )
+        assert request.status_code == 201, request.text
+        request_id = request.json()["request"]["id"]
+
+        with admin_client(url) as api:
+            api.approve_ticket_request(request_id)
+
+        activation = ticket_session.post(
+            f"{url}/@warpgate/api/ticket-requests/{request_id}/activate"
+        )
+        assert activation.status_code == 200, activation.text
+        activation_data = activation.json()
+        assert activation_data["secret"] is not None
+        ticket_id = activation_data["request"]["ticket_id"]
+        assert ticket_id
+
+        id_token = _obtain_oidc_id_token(oidc_port, redirect_uri)
+        endpoint = f"https://localhost:{wg.kubernetes_port}/{target_name}/version"
+        headers = {"Authorization": f"Bearer {id_token}"}
+        allowed = requests.get(endpoint, headers=headers, verify=False)
+        assert allowed.status_code == 200, allowed.text
+
+        second_request = ticket_session.post(
+            f"{url}/@warpgate/api/ticket-requests",
+            json={
+                "target_name": target_name,
+                "duration_seconds": 3600,
+                "description": "overlapping OIDC JIT grant",
+            },
+        )
+        assert second_request.status_code == 201, second_request.text
+        second_request_id = second_request.json()["request"]["id"]
+        with admin_client(url) as api:
+            api.approve_ticket_request(second_request_id)
+        second_activation = ticket_session.post(
+            f"{url}/@warpgate/api/ticket-requests/{second_request_id}/activate"
+        )
+        assert second_activation.status_code == 200, second_activation.text
+        second_ticket_id = second_activation.json()["request"]["ticket_id"]
+        assert second_ticket_id
+
+        revoked = ticket_session.delete(f"{url}/@warpgate/api/my-tickets/{ticket_id}")
+        assert revoked.status_code == 204, revoked.text
+
+        still_allowed = requests.get(endpoint, headers=headers, verify=False)
+        assert still_allowed.status_code == 200, still_allowed.text
+
+        revoked = ticket_session.delete(
+            f"{url}/@warpgate/api/my-tickets/{second_ticket_id}"
+        )
+        assert revoked.status_code == 204, revoked.text
+
+        denied = requests.get(endpoint, headers=headers, verify=False)
+        assert denied.status_code == 403, denied.text
+
+    @pytest.mark.asyncio
+    async def test_kubectl_sso_credential_policy_rejects_api_tokens(
+        self, processes: ProcessManager
+    ):
+        """A Kubernetes ``sso`` policy accepts OIDC but rejects API tokens.
+
+        The successful OIDC request deliberately comes first. This also checks
+        that a cached OIDC authorization cannot be reused by the same user's
+        API token on the same target and source IP.
+        """
+        target_role = f"k8s-oidc-role-{uuid.uuid4()}"
+        oidc_port, redirect_uri = self._start_oidc_mock_for_roles(processes, [])
+        wg, target_name, _k3s = self._start_wg_and_k3s_target(
+            processes,
+            oidc_port=oidc_port,
+            role_mappings={},
+            target_role_name=target_role,
+        )
+        url = f"https://localhost:{wg.http_port}"
+
+        # The identity has normal target access, but only a verified OIDC
+        # credential should satisfy its Kubernetes `sso` policy.
+        with admin_client(url) as api:
+            user = api.create_user(
+                sdk.CreateUserRequest(username=f"user-{uuid.uuid4()}")
+            )
+            api.create_password_credential(
+                user.id, sdk.NewPasswordCredential(password="123")
+            )
+            api.create_sso_credential(
+                user.id,
+                sdk.NewSsoCredential(
+                    email="sam.tailor@gmail.com",
+                    provider="test-oidc",
+                ),
+            )
+            api.update_user(
+                user.id,
+                sdk.UserDataRequest(
+                    username=user.username,
+                    credential_policy=sdk.UserRequireCredentialsPolicy(
+                        kubernetes=[sdk.CredentialKind.SSO],
+                    ),
+                ),
+            )
+            roles = api.get_roles()
+            role = next(role for role in roles if role.name == target_role)
+            api.add_user_role(user.id, role.id)
+
+        id_token = _obtain_oidc_id_token(oidc_port, redirect_uri)
+        endpoint = f"https://localhost:{wg.kubernetes_port}/{target_name}/version"
+        oidc_response = requests.get(
+            endpoint,
+            headers={"Authorization": f"Bearer {id_token}"},
+            verify=False,
+        )
+        assert oidc_response.status_code == 200, oidc_response.text
+
+        api_token = create_api_token(url, user.username, "123")
+        api_token_response = requests.get(
+            endpoint,
+            headers={"Authorization": f"Bearer {api_token}"},
+            verify=False,
+        )
+        assert api_token_response.status_code == 401, api_token_response.text
 
     @pytest.mark.asyncio
     async def test_kubectl_oidc_trusted_audience_accepted(

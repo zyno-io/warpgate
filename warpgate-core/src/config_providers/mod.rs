@@ -7,7 +7,7 @@ mod sso_user;
 pub use db::DatabaseConfigProvider;
 use enum_dispatch::enum_dispatch;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Select};
 pub use sso_user::resolve_and_map_sso_user;
 use time::OffsetDateTime;
 use tracing::warn;
@@ -286,6 +286,83 @@ pub async fn authorize_ticket(
         warn!("Ticket not found");
         Ok(None)
     }
+}
+
+/// Apply the eligibility constraints shared by Kubernetes's server-side
+/// self-service ticket grant checks.
+///
+/// A Kubernetes client makes many requests for one logical connection, so this
+/// deliberately excludes tickets with a bounded use count. The ticket must
+/// instead be valid for the named user and target until it expires or is
+/// revoked.
+fn active_self_service_ticket_query(
+    query: Select<e::Ticket::Entity>,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Select<e::Ticket::Entity> {
+    let now = OffsetDateTime::now_utc();
+    query
+        .filter(e::Ticket::Column::UserId.eq(user_id))
+        .filter(e::Ticket::Column::TargetId.eq(target_id))
+        .filter(e::Ticket::Column::SelfService.eq(true))
+        .filter(e::Ticket::Column::UsesLeft.is_null())
+        .filter(
+            Expr::col(e::Ticket::Column::Expiry)
+                .is_null()
+                .or(Expr::col(e::Ticket::Column::Expiry).gt(now)),
+        )
+}
+
+async fn find_active_self_service_ticket(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Result<Option<e::Ticket::Model>, WarpgateError> {
+    active_self_service_ticket_query(e::Ticket::Entity::find(), user_id, target_id)
+        .one(db)
+        .await
+        .map_err(Into::into)
+}
+
+/// Resolve a self-service ticket as a server-side, time-bounded grant for its
+/// named user.  This is deliberately distinct from [`authorize_ticket`], which
+/// proves possession of a ticket secret for protocols that do not have a
+/// federated user identity.
+///
+/// The caller has already authenticated `user` (for example with a verified
+/// OIDC ID token).  A self-service ticket binds that identity directly to this
+/// target, so no access-role lookup is involved.  Ticket use-counts represent
+/// secret-based connections and cannot safely be applied to Kubernetes's
+/// multi-request API; OIDC-backed grants therefore require unlimited uses.
+pub async fn authorize_active_self_service_ticket(
+    db: &DatabaseConnection,
+    user: &User,
+    target: Target,
+    protocol: Protocol,
+) -> Result<Option<TargetAuthorization>, WarpgateError> {
+    let ticket = find_active_self_service_ticket(db, user.id, target.id).await?;
+
+    Ok(ticket.map(|_| TargetAuthorization {
+        user_info: user.into(),
+        target,
+        protocol,
+    }))
+}
+
+/// Re-check an OIDC-backed ticket grant before proxying each Kubernetes
+/// request.  This makes expiry and user-initiated revocation effective even
+/// while a Kubernetes client has an existing connection correlation cached. A
+/// user may have overlapping active tickets for one target; they collectively
+/// constitute the grant, so revoking one leaves access intact while another is
+/// valid.
+pub async fn has_active_self_service_ticket(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Result<bool, WarpgateError> {
+    Ok(find_active_self_service_ticket(db, user_id, target_id)
+        .await?
+        .is_some())
 }
 
 pub async fn consume_ticket(

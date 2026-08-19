@@ -11,12 +11,16 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use warpgate_aws::EksClusterInfo;
 use warpgate_ca::{deserialize_certificate, serialize_certificate_serial};
-use warpgate_common::auth::{AuthResult, AuthState, CredentialKind};
+use warpgate_common::auth::{
+    AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind,
+};
 use warpgate_common::{SessionId, TargetKubernetesOptions, TargetOptions, User};
 use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::{
-    AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization, authorize_for_target,
+    AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization,
+    authorize_active_self_service_ticket, authorize_for_target, has_active_self_service_ticket,
     vet_credential_bearer, wait_for_auth_completion,
 };
 use warpgate_db_entities::{CertificateCredential, CertificateRevocation};
@@ -28,6 +32,110 @@ pub fn unauthorized() -> poem::Error {
         "Unauthorized: provide a valid Bearer token or client certificate",
         poem::http::StatusCode::UNAUTHORIZED,
     )
+}
+
+fn access_denied(target_name: &str) -> poem::Error {
+    poem::Error::from_string(
+        format!("Access denied to target: {target_name}"),
+        poem::http::StatusCode::FORBIDDEN,
+    )
+}
+
+/// A Kubernetes request's proven identity. OIDC is kept distinct from other
+/// user credentials because a self-service ticket is a grant for a federated
+/// identity, not a substitute bearer credential.
+#[derive(Clone)]
+pub enum KubernetesAuthentication {
+    User(User),
+    Oidc {
+        user: User,
+        credential: AuthCredential,
+    },
+}
+
+impl KubernetesAuthentication {
+    pub fn user_info(&self) -> AuthStateUserInfo {
+        match self {
+            Self::User(user) | Self::Oidc { user, .. } => user.into(),
+        }
+    }
+
+    fn user(&self) -> &User {
+        match self {
+            Self::User(user) | Self::Oidc { user, .. } => user,
+        }
+    }
+
+    fn oidc_user(&self) -> Option<&User> {
+        match self {
+            Self::User(_) => None,
+            Self::Oidc { user, .. } => Some(user),
+        }
+    }
+
+    fn credential(&self) -> Option<&AuthCredential> {
+        match self {
+            Self::User(_) => None,
+            Self::Oidc { credential, .. } => Some(credential),
+        }
+    }
+
+    pub fn authentication_source(&self) -> &'static str {
+        match self {
+            Self::User(_) => "user",
+            Self::Oidc { .. } => "oidc",
+        }
+    }
+}
+
+/// A Kubernetes target authorization.  Tickets deliberately stay server-side:
+/// the browser activation grants the authenticated OIDC user access, and the
+/// ticket is rechecked before every proxied request.
+#[derive(Clone)]
+pub struct KubernetesTargetAuthorization {
+    authorization: TargetAuthorization,
+    ticket_grant: bool,
+}
+
+impl KubernetesTargetAuthorization {
+    fn from_role(authorization: TargetAuthorization) -> Self {
+        Self {
+            authorization,
+            ticket_grant: false,
+        }
+    }
+
+    fn from_ticket(authorization: TargetAuthorization) -> Self {
+        Self {
+            authorization,
+            ticket_grant: true,
+        }
+    }
+
+    pub async fn verify_current(
+        &self,
+        authentication: &KubernetesAuthentication,
+        services: &Services,
+    ) -> poem::Result<()> {
+        if !self.ticket_grant {
+            return Ok(());
+        }
+        let Some(user) = authentication.oidc_user() else {
+            return Err(unauthorized());
+        };
+
+        if has_active_self_service_ticket(&services.db, user.id, self.authorization.target().id)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(access_denied(&self.authorization.target().name))
+        }
+    }
+
+    pub fn into_parts(self) -> (AuthStateUserInfo, warpgate_common::Target) {
+        self.authorization.into_parts()
+    }
 }
 
 /// What kind of credential the client presented, for audit and rate-limiting.
@@ -72,7 +180,7 @@ fn emit_authentication_failed(client_ip: Option<IpAddr>, credential_type: &str, 
 pub async fn authenticate_kubernetes_user(
     req: &Request,
     services: &Services,
-) -> poem::Result<User> {
+) -> poem::Result<KubernetesAuthentication> {
     let client_ip = get_client_ip_addr(req, services).await;
 
     // Fail closed if login protection currently has this source IP blocked.
@@ -89,7 +197,7 @@ pub async fn authenticate_kubernetes_user(
 
     let credential_kind = presented_credential_kind(req);
 
-    let Some(user) = authenticate(req, services).await? else {
+    let Some(authentication) = authenticate(req, services).await? else {
         // A presented-but-invalid credential counts toward brute-force
         // protection and is audited; a request with no credential at all is a
         // plain unauthenticated probe and is neither recorded nor audited.
@@ -108,26 +216,27 @@ pub async fn authenticate_kubernetes_user(
         return Err(unauthorized());
     };
 
-    // Account lockout and the user's IP allow-list, both fail-closed.
-    if !vet_credential_bearer(&services.login_protection, &user, client_ip).await? {
+    if !vet_credential_bearer(&services.login_protection, authentication.user(), client_ip).await? {
         return Err(unauthorized());
     }
 
     // A validated transport credential clears the failed-attempt counter.
     if let Some(ip) = client_ip {
+        let user_info = authentication.user_info();
         let _ = services
             .login_protection
-            .clear_failed_attempts(&ip, &user.username)
+            .clear_failed_attempts(&ip, &user_info.username)
             .await;
     }
 
-    Ok(user)
+    Ok(authentication)
 }
 
 /// Authorize an already-authenticated user for a Kubernetes target, applying the
-/// credential policy — in practice a web-approval factor, which may block. This is
-/// the expensive step, so the caller caches the result per correlated session so it
-/// runs once per session (one approval per `kubectl` command's fan-out of requests)
+/// credential policy. A verified OIDC identity supplies the policy's `sso`
+/// credential; an optional `web` factor may still block. This is the expensive
+/// step, so the caller caches the result per correlated session so it runs once
+/// per session (one approval per `kubectl` command's fan-out of requests)
 /// rather than once per request.
 ///
 /// `session_id` is that of the session the caller has registered for this
@@ -135,18 +244,47 @@ pub async fn authenticate_kubernetes_user(
 /// raised on another node be routed back to the waiting request.
 pub async fn authorize_kubernetes_target(
     req: &Request,
-    user: &User,
+    authentication: &KubernetesAuthentication,
     target_name: &str,
     session_id: SessionId,
     services: &Services,
-) -> poem::Result<TargetAuthorization> {
+) -> poem::Result<KubernetesTargetAuthorization> {
+    let target = lookup_k8s_target(services.config_provider.as_ref(), target_name).await?;
+
+    // A self-service ticket is a server-side JIT authorization grant for the
+    // person whose OIDC token authenticated this request.  It is intentionally
+    // checked before credential-policy web approval: activating the approved
+    // ticket is the explicit, audited approval step for this target.
+    if let Some(user) = authentication.oidc_user()
+        && let Some(authorization) = authorize_active_self_service_ticket(
+            &services.db,
+            user,
+            target.clone(),
+            crate::PROTOCOL_NAME,
+        )
+        .await?
+    {
+        return Ok(KubernetesTargetAuthorization::from_ticket(authorization));
+    }
+
+    let user = authentication.user();
     let client_ip = get_client_ip_addr(req, services).await;
 
-    // When the user has a Kubernetes credential policy, enforce its web-approval
-    // factor on top of the transport identity; otherwise use the identity directly.
-    let identity =
-        authorize_kubernetes_identity(services, user, client_ip, target_name, session_id).await?;
-    lookup_authorized_k8s_target(services.config_provider.as_ref(), target_name, &identity).await
+    // When the user has a Kubernetes credential policy, enforce it against the
+    // verified transport credential; otherwise use the identity directly.
+    let identity = authorize_kubernetes_identity(
+        services,
+        authentication,
+        user,
+        client_ip,
+        target_name,
+        session_id,
+    )
+    .await?;
+    authorize_for_target(services.config_provider.as_ref(), &identity, target)
+        .await?
+        .map(KubernetesTargetAuthorization::from_role)
+        .ok_or_else(|| access_denied(target_name))
 }
 
 /// Turn a validated Kubernetes identity into an [`AuthorizedIdentity`], applying
@@ -154,9 +292,9 @@ pub async fn authorize_kubernetes_target(
 ///
 /// Transport authentication (WG API token, OIDC token, or client certificate)
 /// establishes *who* the caller is — it is the identity, verified out of band by
-/// [`authenticate`]. The Kubernetes credential policy only layers an optional
-/// web-approval factor on top, the one factor a non-interactive client can
-/// satisfy, so no transport credential is ever submitted to the auth state here.
+/// [`authenticate`]. A verified OIDC token additionally supplies an `sso`
+/// credential to the policy. API-token and client-certificate authentication do
+/// not, so they cannot satisfy a Kubernetes `sso` requirement.
 ///
 /// With no policy the transport identity is used directly. With one, a fresh auth
 /// state enforces the web approval, cleared either by a cached grace-period bypass
@@ -165,6 +303,7 @@ pub async fn authorize_kubernetes_target(
 /// the wait).
 async fn authorize_kubernetes_identity(
     services: &Services,
+    authentication: &KubernetesAuthentication,
     user: &User,
     client_ip: Option<IpAddr>,
     target_name: &str,
@@ -183,24 +322,45 @@ async fn authorize_kubernetes_identity(
         ));
     }
 
+    let mut supported_credential_types = vec![CredentialKind::WebUserApproval];
+    if let Some(credential) = authentication.credential() {
+        supported_credential_types.push(credential.kind());
+    }
+
     let state_arc = services
         .create_auth_state(
             &session_id,
             &user.username,
             crate::PROTOCOL_NAME,
             target_name,
-            &[CredentialKind::WebUserApproval],
+            &supported_credential_types,
             client_ip,
             None,
         )
         .await?;
 
-    await_kubernetes_web_approval(services, user, &state_arc).await
+    if let Some(credential) = authentication.credential() {
+        let outcome = {
+            let mut state = state_arc.lock().await;
+            submit_credential(
+                &mut state,
+                credential.clone(),
+                services.config_provider.as_ref(),
+            )
+            .await?
+        };
+        if !outcome.is_valid() {
+            warn!(username = %user.username, "Kubernetes OIDC credential rejected");
+            return Err(unauthorized());
+        }
+    }
+
+    await_kubernetes_credential_policy(services, user, &state_arc).await
 }
 
-/// Blocks until the pending web approval resolves, either from a cached
-/// grace-period bypass or from the user acting on the request in the UI.
-async fn await_kubernetes_web_approval(
+/// Resolves the credential policy, waiting only when it additionally requires
+/// browser approval.
+async fn await_kubernetes_credential_policy(
     services: &Services,
     user: &User,
     state_arc: &Arc<Mutex<AuthState>>,
@@ -224,10 +384,9 @@ async fn await_kubernetes_web_approval(
                     return Err(unauthorized());
                 }
             }
-            // Kubernetes only enforces web approval on top of transport auth; a
-            // policy that requires any other factor can't be collected for a
-            // non-interactive client and is denied. The policy editor should not
-            // offer such a combination.
+            // An OIDC identity may satisfy `sso`, and browser approval can
+            // satisfy `web`. Other outstanding factors cannot be collected from
+            // a non-interactive Kubernetes client.
             AuthResult::Need(_) | AuthResult::Rejected => {
                 warn!(username = %user.username, "Kubernetes credential policy not satisfiable");
                 return Err(unauthorized());
@@ -239,18 +398,20 @@ async fn await_kubernetes_web_approval(
 /// Resolve the caller's identity from the request's transport credentials (WG API
 /// token, OIDC bearer token, or client certificate). Each is verified here and
 /// establishes *who* the caller is; that transport auth is the identity, so the
-/// caller doesn't re-validate it against a credential policy (a policy only layers
-/// web approval on top). Returns `None` if no presented credential validated;
-/// genuine lookup/verification errors propagate rather than being treated as a
-/// failure.
-async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option<User>> {
+/// caller may also submit a verified OIDC identity to its credential policy.
+/// Returns `None` if no presented credential validated; genuine
+/// lookup/verification errors propagate rather than being treated as a failure.
+async fn authenticate(
+    req: &Request,
+    services: &Services,
+) -> poem::Result<Option<KubernetesAuthentication>> {
     // Bearer token authentication (API tokens, then OIDC ID tokens).
     if let Some(auth_header) = req.headers().get("authorization")
         && let Ok(auth_str) = auth_header.to_str()
         && let Some(token) = auth_str.strip_prefix("Bearer ")
     {
         if let Ok(Some(user)) = services.config_provider.validate_api_token(token).await {
-            return Ok(Some(user));
+            return Ok(Some(KubernetesAuthentication::User(user)));
         }
 
         // API token did not match — try OIDC ID token validation against any SSO
@@ -290,6 +451,14 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
                 }
             };
 
+            // Warpgate's canonical SSO resolver keys a user linkage on the
+            // provider and verified email. This is also the identity bound to
+            // an SSO credential policy and a server-side ticket grant, so an
+            // OIDC token without an email claim cannot authenticate here.
+            let Some(email) = response.email.clone() else {
+                continue;
+            };
+
             let Some(username) = warpgate_core::resolve_and_map_sso_user(
                 services.config_provider.as_ref(),
                 provider_config,
@@ -306,11 +475,12 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
                 continue;
             };
 
-            // The verified OIDC token is the identity; it is not re-checked against
-            // the stored-SSO-linkage `validate_credential` arm, which would deny
-            // legitimately-authenticated users resolved via preferred-username or
-            // role mapping.
-            return Ok(Some(user_for_username(services, &username).await?));
+            let user = user_for_username(services, &username).await?;
+            let credential = AuthCredential::Sso {
+                provider: provider_config.name.clone(),
+                email,
+            };
+            return Ok(Some(KubernetesAuthentication::Oidc { user, credential }));
         }
     }
 
@@ -320,7 +490,7 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
         debug!("Found client certificate from middleware, validating against database");
 
         match validate_client_certificate(&client_cert.der_bytes, services).await {
-            Ok(Some(user)) => return Ok(Some(user)),
+            Ok(Some(user)) => return Ok(Some(KubernetesAuthentication::User(user))),
             Ok(None) => debug!("Client certificate provided but not found in database"),
             // A rejected certificate returns `Ok(None)`; an `Err` is a fault in the
             // certificate store (DB) or an unparseable cert, not a credential
@@ -340,14 +510,13 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
     Ok(None)
 }
 
-/// Look up a Kubernetes target by name and prove the user is authorized for it.
-/// Shared by the API-token, OIDC and client-certificate auth paths.
-async fn lookup_authorized_k8s_target<C: ConfigProvider + Send>(
+/// Look up a Kubernetes target by name before authorizing it through either an
+/// access role or an active self-service ticket.
+async fn lookup_k8s_target<C: ConfigProvider + Send>(
     config_provider: &C,
     target_name: &str,
-    identity: &AuthorizedIdentity,
-) -> poem::Result<TargetAuthorization> {
-    let target = config_provider
+) -> poem::Result<warpgate_common::Target> {
+    config_provider
         .get_target_by_name(target_name)
         .await
         .context("looking up target")?
@@ -356,15 +525,6 @@ async fn lookup_authorized_k8s_target<C: ConfigProvider + Send>(
             poem::Error::from_string(
                 format!("Kubernetes target not found: {target_name}"),
                 poem::http::StatusCode::NOT_FOUND,
-            )
-        })?;
-
-    authorize_for_target(config_provider, identity, target)
-        .await?
-        .ok_or_else(|| {
-            poem::Error::from_string(
-                format!("Access denied to target: {target_name}"),
-                poem::http::StatusCode::FORBIDDEN,
             )
         })
 }
