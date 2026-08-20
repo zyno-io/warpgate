@@ -26,9 +26,6 @@ class Test:
                 sdk.RoleDataRequest(name=f"role-{uuid4()}"),
             )
             user = api.create_user(sdk.CreateUserRequest(username=f"user-{uuid4()}"))
-            api.create_password_credential(
-                user.id, sdk.NewPasswordCredential(password="123")
-            )
             api.add_user_role(user.id, role.id)
             ssh_target = api.create_target(
                 sdk.TargetDataRequest(
@@ -62,12 +59,13 @@ class Test:
                 "-p",
                 str(shared_wg.ssh_port),
                 "-i",
-                "/dev/null",
+                str(Path("ssh-keys/id_ed25519")),
                 "-o",
-                "PreferredAuthentications=password",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey",
                 "ls",
                 "/bin/sh",
-                password="123",
             )
             assert ssh_client.communicate(timeout=timeout)[0] == b"/bin/sh\n"
             assert ssh_client.returncode == 0
