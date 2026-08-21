@@ -30,7 +30,7 @@ use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::recordings::{self, TerminalRecorder, TrafficConnectionParams, TrafficRecorder};
 use warpgate_core::{
     AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization, WarpgateServerHandle,
-    authorize_for_target, authorize_for_target_by_name, authorize_ticket, consume_ticket,
+    authorize_active_self_service_ticket, authorize_for_target, authorize_ticket, consume_ticket,
 };
 use warpgate_db_entities::Parameters;
 use warpgate_db_entities::Parameters::SshHostKeyVerificationMode;
@@ -2281,13 +2281,37 @@ impl ServerSession {
                             let Some(identity) = AuthorizedIdentity::from_auth_state(&state) else {
                                 return Ok(AuthResult::Rejected);
                             };
-                            let Some(authorization) = authorize_for_target_by_name(
+                            let Some(target) = self
+                                .services
+                                .config_provider
+                                .get_target_by_name(target_name)
+                                .await?
+                            else {
+                                warn!(
+                                    "Target {} not authorized for user {}",
+                                    target_name, username
+                                );
+                                return Ok(AuthResult::Rejected);
+                            };
+                            let role_authorization = authorize_for_target(
                                 self.services.config_provider.as_ref(),
                                 &identity,
-                                target_name,
+                                target.clone(),
                             )
-                            .await?
-                            else {
+                            .await?;
+                            let authorization = match role_authorization {
+                                Some(authorization) => Some(authorization),
+                                None => {
+                                    authorize_active_self_service_ticket(
+                                        &self.services.db,
+                                        identity.user_info().clone(),
+                                        target,
+                                        crate::PROTOCOL_NAME,
+                                    )
+                                    .await?
+                                }
+                            };
+                            let Some(authorization) = authorization else {
                                 warn!(
                                     "Target {} not authorized for user {}",
                                     target_name, username

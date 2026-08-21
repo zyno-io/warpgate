@@ -258,7 +258,7 @@ pub async fn authorize_kubernetes_target(
     if let Some(user) = authentication.oidc_user()
         && let Some(authorization) = authorize_active_self_service_ticket(
             &services.db,
-            user,
+            user.into(),
             target.clone(),
             crate::PROTOCOL_NAME,
         )

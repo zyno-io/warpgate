@@ -330,32 +330,32 @@ async fn find_active_self_service_ticket(
 /// proves possession of a ticket secret for protocols that do not have a
 /// federated user identity.
 ///
-/// The caller has already authenticated `user` (for example with a verified
-/// OIDC ID token).  A self-service ticket binds that identity directly to this
-/// target, so no access-role lookup is involved.  Ticket use-counts represent
-/// secret-based connections and cannot safely be applied to Kubernetes's
-/// multi-request API; OIDC-backed grants therefore require unlimited uses.
+/// The caller has already authenticated `user_info` (for example with a
+/// verified OIDC ID token or an SSH public key). A self-service ticket binds
+/// that identity directly to this target, so no access-role lookup is involved.
+/// Ticket use-counts represent secret-based connections and cannot safely be
+/// applied to a server-side, session-based grant; those grants therefore
+/// require unlimited uses.
 pub async fn authorize_active_self_service_ticket(
     db: &DatabaseConnection,
-    user: &User,
+    user_info: AuthStateUserInfo,
     target: Target,
     protocol: Protocol,
 ) -> Result<Option<TargetAuthorization>, WarpgateError> {
-    let ticket = find_active_self_service_ticket(db, user.id, target.id).await?;
+    let ticket = find_active_self_service_ticket(db, user_info.id, target.id).await?;
 
     Ok(ticket.map(|_| TargetAuthorization {
-        user_info: user.into(),
+        user_info,
         target,
         protocol,
     }))
 }
 
-/// Re-check an OIDC-backed ticket grant before proxying each Kubernetes
-/// request.  This makes expiry and user-initiated revocation effective even
-/// while a Kubernetes client has an existing connection correlation cached. A
-/// user may have overlapping active tickets for one target; they collectively
-/// constitute the grant, so revoking one leaves access intact while another is
-/// valid.
+/// Re-check an active ticket grant. This makes expiry and user-initiated
+/// revocation effective while a protocol has an existing connection
+/// correlation cached. A user may have overlapping active tickets for one
+/// target; they collectively constitute the grant, so revoking one leaves
+/// access intact while another is valid.
 pub async fn has_active_self_service_ticket(
     db: &DatabaseConnection,
     user_id: Uuid,
