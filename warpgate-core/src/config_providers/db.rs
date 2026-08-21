@@ -28,6 +28,37 @@ pub struct DatabaseConfigProvider {
     db: DatabaseConnection,
 }
 
+/// Returns the key material in a canonical form, excluding the optional
+/// human-readable OpenSSH comment.
+fn canonical_openssh_public_key(openssh_public_key: &str) -> Option<String> {
+    let mut key = russh::keys::PublicKey::from_openssh(openssh_public_key).ok()?;
+    key.set_comment("");
+    key.to_openssh().ok()
+}
+
+fn public_keys_match(stored_public_key: &str, presented_public_key: &str) -> bool {
+    canonical_openssh_public_key(stored_public_key)
+        .is_some_and(|stored_key| stored_key == presented_public_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::public_keys_match;
+
+    #[test]
+    fn public_key_matching_ignores_openssh_comments() {
+        let mut fields = include_str!("../../../tests/ssh-keys/id_ed25519.pub").split_whitespace();
+        let key_material = format!(
+            "{} {}",
+            fields.next().expect("public key type"),
+            fields.next().expect("public key material"),
+        );
+        let stored_public_key = format!("{key_material} workstation@example.com");
+
+        assert!(public_keys_match(&stored_public_key, &key_material));
+    }
+}
+
 /// Joins active (non-revoked, non-expired) user role assignments to target
 /// role assignments; callers add the authorization predicates and selection.
 fn active_role_assignment_query() -> sea_orm::sea_query::SelectStatement {
@@ -576,7 +607,7 @@ impl ConfigProvider for DatabaseConfigProvider {
                     .any(|credential| match credential {
                         UserAuthCredential::PublicKey(UserPublicKeyCredential {
                             key: user_key,
-                        }) => &openssh_public_key == user_key.expose_secret(),
+                        }) => public_keys_match(user_key.expose_secret(), &openssh_public_key),
                         _ => false,
                     }))
             }
@@ -861,6 +892,7 @@ impl ConfigProvider for DatabaseConfigProvider {
 
     async fn update_public_key_last_used(
         &self,
+        username: &str,
         credential: Option<AuthCredential>,
     ) -> Result<(), WarpgateError> {
         let db = &self.db;
@@ -883,14 +915,27 @@ impl ConfigProvider for DatabaseConfigProvider {
             openssh_public_key
         );
 
-        // Find the public key credential
-        let public_key_credential = entities::PublicKeyCredential::Entity::find()
-            .filter(
-                entities::PublicKeyCredential::Column::OpensshPublicKey
-                    .eq(openssh_public_key.clone()),
-            )
+        let user = entities::User::Entity::find()
+            .filter(entities::User::Entity::username_eq_ci(username))
             .one(db)
             .await?;
+
+        let Some(user) = user else {
+            warn!("User not found while updating public key usage: {username}");
+            return Ok(());
+        };
+
+        // Stored keys can include a comment, while SSH authentication presents
+        // key material only. Resolve the matching credential for this user by
+        // its canonical key material rather than by its original text.
+        let public_key_credential = entities::PublicKeyCredential::Entity::find()
+            .filter(entities::PublicKeyCredential::Column::UserId.eq(user.id))
+            .all(db)
+            .await?
+            .into_iter()
+            .find(|stored_credential| {
+                public_keys_match(&stored_credential.openssh_public_key, &openssh_public_key)
+            });
 
         let Some(public_key_credential) = public_key_credential else {
             warn!(

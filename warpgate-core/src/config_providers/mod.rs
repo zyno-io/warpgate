@@ -88,6 +88,7 @@ pub trait ConfigProvider {
 
     async fn update_public_key_last_used(
         &self,
+        username: &str,
         credential: Option<AuthCredential>,
     ) -> Result<(), WarpgateError>;
 
