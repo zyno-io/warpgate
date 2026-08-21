@@ -1897,12 +1897,12 @@ impl ServerSession {
         let result = self.try_auth_lazy(&selector, key.clone()).await;
 
         match result {
-            Ok(AuthResult::Accepted { .. }) => {
+            Ok(AuthResult::Accepted { user_info }) => {
                 // Update last_used timestamp
                 if let Err(err) = self
                     .services
                     .config_provider
-                    .update_public_key_last_used(key.clone())
+                    .update_public_key_last_used(&user_info.username, key.clone())
                     .await
                 {
                     warn!(?err, "Failed to update last_used for public key");
