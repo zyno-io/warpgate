@@ -6,7 +6,7 @@
     } from '@fortawesome/free-solid-svg-icons'
     import { ListGroup } from '@sveltestrap/sveltestrap'
     import { api, type SetupState } from 'gateway/lib/api'
-    import { reloadServerInfo } from 'gateway/lib/store'
+    import { reloadServerInfo, serverInfo } from 'gateway/lib/store'
     import Fa from 'svelte-fa'
 
     export let setupState: SetupState
@@ -20,13 +20,15 @@
 <div class="getting-started-help border-secondary">
     <div class="d-flex align-items-center mb-3">
         <h2 class="mb-0">getting started</h2>
-        <button
-            type="button"
-            class="btn btn-link ms-auto p-0 text-muted"
-            onclick={dismiss}
-        >
-            Dismiss
-        </button>
+        {#if $serverInfo?.adminPermissions?.configEdit}
+            <button
+                type="button"
+                class="btn btn-link ms-auto p-0 text-muted"
+                onclick={dismiss}
+            >
+                Dismiss
+            </button>
+        {/if}
     </div>
 
     <ListGroup flush>

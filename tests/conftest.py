@@ -68,6 +68,24 @@ class K3sInstance:
                 raise
         return ret
 
+    def trust_client_ca(self, certificate_pem: str) -> None:
+        """Add a CA certificate to the kube-apiserver's client-CA bundle."""
+        ret = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                self.container_name,
+                "sh",
+                "-c",
+                "cat >> /var/lib/rancher/k3s/server/tls/client-ca.crt",
+            ],
+            input=(certificate_pem.rstrip() + "\n").encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        ret.check_returncode()
+
 
 @dataclass
 class Child:

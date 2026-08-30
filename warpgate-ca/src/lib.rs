@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use aws_lc_rs::digest;
 use aws_lc_rs::error::KeyRejected;
-use aws_lc_rs::signature::{ECDSA_P384_SHA3_384_ASN1_SIGNING, EcdsaKeyPair};
+use aws_lc_rs::signature::{ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair};
 use data_encoding::BASE64;
 use der::{Decode, DecodePem, Encode};
 use rcgen::{
@@ -145,8 +145,7 @@ impl ClusterTlsIdentity {
         // Backdated in case of clock skew
         // long-lived cause it's never rotated until the process dies
         params.not_before = (SystemTime::now() - Duration::from_mins(5)).into();
-        params.not_after =
-            (SystemTime::now() + Duration::from_hours(87600)).into();
+        params.not_after = (SystemTime::now() + Duration::from_hours(87600)).into();
 
         let certificate = params.signed_by(&key_pair, &issuer)?;
         Ok(Self {
@@ -155,6 +154,139 @@ impl ClusterTlsIdentity {
             private_key_pem: key_pair.serialize_pem(),
         })
     }
+}
+
+/// A short-lived mTLS identity for a Kubernetes API client.
+///
+/// The private key is generated for the identity and is intentionally kept only
+/// in the caller's in-memory session cache.
+pub struct KubernetesClientIdentity {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    pub not_after: SystemTime,
+}
+
+/// Issue a short-lived Kubernetes client certificate from the Warpgate instance
+/// CA. Kubernetes maps the subject common name to the authenticated username
+/// and every organization name to a group.
+pub fn issue_kubernetes_client_identity(
+    ca_certificate_pem: &str,
+    ca_private_key_pem: &str,
+    username: &str,
+    groups: &[String],
+    validity: Duration,
+) -> Result<KubernetesClientIdentity, CaError> {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)?;
+    let ca = deserialize_ca(ca_certificate_pem, ca_private_key_pem)?;
+    let certificate = issue_kubernetes_client_certificate(
+        &ca,
+        username,
+        groups,
+        &key_pair.public_key_pem(),
+        validity,
+    )?;
+    Ok(KubernetesClientIdentity {
+        certificate_pem: certificate_to_pem(&certificate)?,
+        private_key_pem: key_pair.serialize_pem(),
+        not_after: SystemTime::now() + validity,
+    })
+}
+
+fn issue_kubernetes_client_certificate(
+    ca: &CertifiedKey,
+    username: &str,
+    groups: &[String],
+    public_key_pem: &str,
+    validity_duration: Duration,
+) -> Result<Certificate, CaError> {
+    use const_oid::db::{rfc4519, rfc5280, rfc5912};
+    use der::asn1::{OctetString, SetOfVec, Utf8StringRef};
+    use x509_cert::attr::AttributeTypeAndValue;
+    use x509_cert::ext::Extension;
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
+    use x509_cert::name::{RdnSequence, RelativeDistinguishedName};
+
+    let ca_key_pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &ca.private_key_der)?;
+    let now = SystemTime::now();
+    let validity = Validity {
+        // Kubernetes API servers can be a few minutes behind the gateway. A
+        // small backdate avoids rejecting a freshly issued client certificate.
+        not_before: (now - Duration::from_secs(5 * 60)).try_into()?,
+        not_after: (now + validity_duration).try_into()?,
+    };
+
+    let attribute = |oid, value: &str| -> Result<AttributeTypeAndValue, CaError> {
+        Ok(AttributeTypeAndValue {
+            oid,
+            value: Utf8StringRef::new(value)?.into(),
+        })
+    };
+    let mut rdns = vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![
+        attribute(rfc4519::COMMON_NAME, username)?,
+    ])?)];
+    for group in groups {
+        rdns.push(RelativeDistinguishedName::from(SetOfVec::try_from(vec![
+            attribute(rfc4519::ORGANIZATION_NAME, group)?,
+        ])?));
+    }
+    let subject = RdnSequence::from(rdns);
+
+    let serial_number = generate_serial_number(username)?;
+    let public_key = SubjectPublicKeyInfo::from_pem(public_key_pem)?;
+    let tbs_cert = TbsCertificate {
+        version: Version::V3,
+        serial_number,
+        signature: AlgorithmIdentifier {
+            oid: rfc5912::ECDSA_WITH_SHA_384,
+            parameters: None,
+        },
+        issuer: ca.certificate.tbs_certificate.issuer.clone(),
+        validity,
+        subject,
+        subject_public_key_info: public_key,
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: Some(vec![
+            Extension {
+                extn_id: rfc5280::ID_CE_BASIC_CONSTRAINTS,
+                critical: true,
+                extn_value: OctetString::new(
+                    BasicConstraints {
+                        ca: false,
+                        path_len_constraint: None,
+                    }
+                    .to_der()?,
+                )?,
+            },
+            Extension {
+                extn_id: rfc5280::ID_CE_KEY_USAGE,
+                critical: true,
+                extn_value: OctetString::new(
+                    KeyUsage(KeyUsages::DigitalSignature.into()).to_der()?,
+                )?,
+            },
+            Extension {
+                extn_id: rfc5280::ID_CE_EXT_KEY_USAGE,
+                critical: false,
+                extn_value: OctetString::new(
+                    ExtendedKeyUsage(vec![rfc5280::ID_KP_CLIENT_AUTH]).to_der()?,
+                )?,
+            },
+        ]),
+    };
+
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let tbs_cert_der = tbs_cert.to_der()?;
+    let signature = ca_key_pair.sign(&rng, &tbs_cert_der)?;
+    Ok(Certificate {
+        tbs_certificate: tbs_cert,
+        signature_algorithm: AlgorithmIdentifier {
+            oid: rfc5912::ECDSA_WITH_SHA_384,
+            parameters: None,
+        },
+        signature: der::asn1::BitString::from_bytes(signature.as_ref())?,
+    })
 }
 
 /// SHA256 of the certificate's SPKI DER as used for peer verification
@@ -197,7 +329,7 @@ pub fn issue_client_certificate(
     use x509_cert::name::{RdnSequence, RelativeDistinguishedName};
 
     let ca_key_pair =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA3_384_ASN1_SIGNING, &ca.private_key_der)?;
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &ca.private_key_der)?;
 
     let validity = {
         let validity = Duration::from_hours(8760);
@@ -305,5 +437,47 @@ mod tests {
             certificate_der_spki_sha256_hex(&cert.to_der().unwrap()).unwrap(),
             identity.spki_sha256_hex,
         );
+    }
+
+    #[test]
+    fn kubernetes_client_identity_has_a_short_lived_client_auth_profile() {
+        let (ca_cert, ca_key) = issue_ca_root_certificate().unwrap();
+        let groups = vec![
+            "warpgate:target:123".to_string(),
+            "warpgate:operators".to_string(),
+        ];
+        let identity = issue_kubernetes_client_identity(
+            &ca_cert,
+            &ca_key,
+            "warpgate:alice@example.com",
+            &groups,
+            Duration::from_secs(5 * 60),
+        )
+        .unwrap();
+
+        let cert = deserialize_certificate(&identity.certificate_pem).unwrap();
+        let cert_der = cert.to_der().unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+        let common_names = parsed
+            .subject()
+            .iter_common_name()
+            .map(|attribute| attribute.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let organizations = parsed
+            .subject()
+            .iter_organization()
+            .map(|attribute| attribute.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let extended_key_usage = parsed
+            .extended_key_usage()
+            .unwrap()
+            .expect("Kubernetes client certificate needs an extended key usage")
+            .value;
+
+        assert_eq!(common_names, ["warpgate:alice@example.com"]);
+        assert_eq!(organizations, groups);
+        assert!(extended_key_usage.client_auth);
+        assert!(!extended_key_usage.server_auth);
+        assert!(identity.not_after <= SystemTime::now() + Duration::from_secs(5 * 60 + 1));
     }
 }
