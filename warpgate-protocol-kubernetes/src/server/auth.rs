@@ -14,14 +14,14 @@ use warpgate_ca::{deserialize_certificate, serialize_certificate_serial};
 use warpgate_common::auth::{
     AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind,
 };
-use warpgate_common::{SessionId, TargetKubernetesOptions, TargetOptions, User};
+use warpgate_common::{TargetKubernetesOptions, TargetOptions, User, UserSessionId};
 use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::{
     AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization,
-    authorize_active_self_service_ticket, authorize_for_target, has_active_self_service_ticket,
-    vet_credential_bearer, wait_for_auth_completion,
+    authorize_active_self_service_ticket, authorize_for_target, vet_credential_bearer,
+    wait_for_auth_completion,
 };
 use warpgate_db_entities::{CertificateCredential, CertificateRevocation, Parameters};
 
@@ -34,7 +34,7 @@ pub fn unauthorized() -> poem::Error {
     )
 }
 
-fn access_denied(target_name: &str) -> poem::Error {
+pub(crate) fn access_denied(target_name: &str) -> poem::Error {
     poem::Error::from_string(
         format!("Access denied to target: {target_name}"),
         poem::http::StatusCode::FORBIDDEN,
@@ -66,7 +66,7 @@ impl KubernetesAuthentication {
         }
     }
 
-    fn oidc_user(&self) -> Option<&User> {
+    pub(crate) fn oidc_user(&self) -> Option<&User> {
         match self {
             Self::User(_) => None,
             Self::Oidc { user, .. } => Some(user),
@@ -91,9 +91,8 @@ impl KubernetesAuthentication {
 /// A Kubernetes target authorization.  Tickets deliberately stay server-side:
 /// the browser activation grants the authenticated OIDC user access, and the
 /// ticket is rechecked before every proxied request.
-#[derive(Clone)]
 pub struct KubernetesTargetAuthorization {
-    authorization: TargetAuthorization,
+    authorization: TargetAuthorization<TargetKubernetesOptions>,
     ticket_grant: bool,
     upstream_certificate_cache: EphemeralKubernetesIdentityCache,
 }
@@ -107,7 +106,7 @@ pub(crate) type EphemeralKubernetesIdentityCache =
     Arc<Mutex<Option<CachedEphemeralKubernetesIdentity>>>;
 
 impl KubernetesTargetAuthorization {
-    fn from_role(authorization: TargetAuthorization) -> Self {
+    fn from_role(authorization: TargetAuthorization<TargetKubernetesOptions>) -> Self {
         Self {
             authorization,
             ticket_grant: false,
@@ -115,7 +114,7 @@ impl KubernetesTargetAuthorization {
         }
     }
 
-    fn from_ticket(authorization: TargetAuthorization) -> Self {
+    fn from_ticket(authorization: TargetAuthorization<TargetKubernetesOptions>) -> Self {
         Self {
             authorization,
             ticket_grant: true,
@@ -123,36 +122,18 @@ impl KubernetesTargetAuthorization {
         }
     }
 
-    pub async fn verify_current(
-        &self,
-        authentication: &KubernetesAuthentication,
-        services: &Services,
-    ) -> poem::Result<()> {
-        if !self.ticket_grant {
-            return Ok(());
-        }
-        let Some(user) = authentication.oidc_user() else {
-            return Err(unauthorized());
-        };
-
-        if has_active_self_service_ticket(&services.db, user.id, self.authorization.target().id)
-            .await?
-        {
-            Ok(())
-        } else {
-            Err(access_denied(&self.authorization.target().name))
-        }
-    }
-
     pub(crate) fn into_parts(
         self,
     ) -> (
-        AuthStateUserInfo,
-        warpgate_common::Target,
+        TargetAuthorization<TargetKubernetesOptions>,
+        bool,
         EphemeralKubernetesIdentityCache,
     ) {
-        let (user_info, target) = self.authorization.into_parts();
-        (user_info, target, self.upstream_certificate_cache)
+        (
+            self.authorization,
+            self.ticket_grant,
+            self.upstream_certificate_cache,
+        )
     }
 }
 
@@ -264,7 +245,7 @@ pub async fn authorize_kubernetes_target(
     req: &Request,
     authentication: &KubernetesAuthentication,
     target_name: &str,
-    session_id: SessionId,
+    session_id: UserSessionId,
     services: &Services,
 ) -> poem::Result<KubernetesTargetAuthorization> {
     let target = lookup_k8s_target(services.config_provider.as_ref(), target_name).await?;
@@ -282,6 +263,9 @@ pub async fn authorize_kubernetes_target(
         )
         .await?
     {
+        let authorization = authorization
+            .narrow()
+            .map_err(|_| access_denied(target_name))?;
         return Ok(KubernetesTargetAuthorization::from_ticket(authorization));
     }
 
@@ -301,8 +285,10 @@ pub async fn authorize_kubernetes_target(
     .await?;
     authorize_for_target(services.config_provider.as_ref(), &identity, target)
         .await?
+        .ok_or_else(|| access_denied(target_name))?
+        .narrow()
         .map(KubernetesTargetAuthorization::from_role)
-        .ok_or_else(|| access_denied(target_name))
+        .map_err(|_| access_denied(target_name))
 }
 
 /// Turn a validated Kubernetes identity into an [`AuthorizedIdentity`], applying
@@ -325,7 +311,7 @@ async fn authorize_kubernetes_identity(
     user: &User,
     client_ip: Option<IpAddr>,
     target_name: &str,
-    session_id: SessionId,
+    session_id: UserSessionId,
 ) -> poem::Result<AuthorizedIdentity> {
     let policy_configured = user
         .credential_policy
@@ -364,6 +350,7 @@ async fn authorize_kubernetes_identity(
                 &mut state,
                 credential.clone(),
                 services.config_provider.as_ref(),
+                &services.login_protection,
             )
             .await?
         };

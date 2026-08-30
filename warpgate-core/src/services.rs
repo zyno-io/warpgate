@@ -8,8 +8,10 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::sync::Mutex;
 use tracing::warn;
 use warpgate_common::auth::{AuthState, CredentialKind};
-use warpgate_common::{GlobalParams, Protocol, Secret, SessionId, WarpgateConfig, WarpgateError};
-use warpgate_db_entities::Parameters;
+use warpgate_common::{
+    GlobalParams, Protocol, Secret, UserSessionId, WarpgateConfig, WarpgateError,
+};
+use warpgate_db_entities::{Parameters, UserSession};
 
 use crate::cluster::Cluster;
 use crate::db::connect_to_db_and_migrate;
@@ -23,7 +25,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Services {
     pub db: DatabaseConnection,
-    pub recordings: Arc<Mutex<SessionRecordings>>,
+    pub recordings: Arc<SessionRecordings>,
     pub config: Arc<Mutex<WarpgateConfig>>,
     pub cluster: Arc<Cluster>,
     pub state: Arc<Mutex<State>>,
@@ -69,8 +71,7 @@ impl Services {
         params: GlobalParams,
     ) -> Result<Self> {
         let db = connect_to_db_and_migrate(&config, &params).await?;
-        let recordings = SessionRecordings::new(db.clone(), &params);
-        let recordings = Arc::new(Mutex::new(recordings));
+        let recordings = Arc::new(SessionRecordings::new(db.clone(), &params));
 
         let cluster = Arc::new(Cluster::new(db.clone(), config.store.http.listen.port()).await?);
 
@@ -140,7 +141,7 @@ impl Services {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_auth_state(
         &self,
-        session_id: &SessionId,
+        session_id: &UserSessionId,
         username: &str,
         protocol: Protocol,
         target_name: &str,
@@ -158,6 +159,17 @@ impl Services {
             rate_limit_credential_type,
         )
         .await?;
+
+        // Link user session to this node which is gonna hold the auth state
+        UserSession::Entity::update_many()
+            .col_expr(
+                UserSession::Column::AuthStateNodeId,
+                Expr::value(self.cluster.node_id),
+            )
+            .filter(UserSession::Column::Id.eq(*session_id))
+            .exec(&self.db)
+            .await?;
+
         Ok(self.auth_state_store.lock().await.create(
             session_id,
             &user,

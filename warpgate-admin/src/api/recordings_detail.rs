@@ -20,7 +20,7 @@ use warpgate_common::{AdminPermission, WarpgateError};
 use warpgate_common_http::AuthenticatedRequestContext;
 use warpgate_core::recordings::{LiveChunk, RecordingFile};
 use warpgate_db_entities::Recording::{self, RecordingKind};
-use warpgate_db_entities::Session;
+use warpgate_db_entities::TargetSession;
 
 use super::ClusterOrAdminContext;
 use crate::api::cluster_proxy::{Owner, proxy_or_serve, proxy_or_serve_websocket, session_owner};
@@ -139,8 +139,6 @@ async fn serve_recording_file(
     let access = ctx
         .services()
         .recordings
-        .lock()
-        .await
         .access(recording, file)
         .await
         .map_err(InternalServerError)?;
@@ -372,7 +370,7 @@ pub async fn api_get_recording_stream(
     let owner = recording_owner(&ctx, &recording).await?;
 
     proxy_or_serve_websocket(&ctx, req, ws, owner, async move |ws| {
-        let recordings = ctx.services().recordings.lock().await;
+        let recordings = &ctx.services().recordings;
         let live = match recordings.subscribe_live(&id).await {
             Some(receiver) => {
                 // An in-progress recording is always a local file on the owner
@@ -405,7 +403,7 @@ pub async fn recording_owner(
     if recording.ended.is_some() {
         return Ok(Owner::Local);
     }
-    let Some(session) = Session::Entity::find_by_id(recording.session_id)
+    let Some(session) = TargetSession::Entity::find_by_id(recording.session_id)
         .one(&ctx.services().db)
         .await?
     else {

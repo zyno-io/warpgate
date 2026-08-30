@@ -5,13 +5,15 @@ use std::time::{Duration, Instant};
 use poem::Request;
 use tokio::sync::Mutex;
 use warpgate_common::auth::{AuthResult, AuthStateUserInfo};
-use warpgate_common::{SessionId, WarpgateError};
+use warpgate_common::{TargetKubernetesOptions, TargetSessionId, UserSessionId, WarpgateError};
 use warpgate_common_http::logging::get_client_ip;
-use warpgate_core::{Services, SessionStateInit, State, WarpgateServerHandle};
+use warpgate_core::{
+    ApprovedTarget, Services, State, TargetSessionStart, UserSessionStateInit, WarpgateServerHandle,
+};
 
 use crate::server::auth::{
-    KubernetesAuthentication, KubernetesTargetAuthorization, authorize_kubernetes_target,
-    unauthorized,
+    EphemeralKubernetesIdentityCache, KubernetesAuthentication, access_denied,
+    authorize_kubernetes_target, unauthorized,
 };
 use crate::session_handle::KubernetesSessionHandle;
 
@@ -21,6 +23,41 @@ struct CorrelationKey {
     target_name: String,
     client_ip: Option<String>,
     authentication_source: String,
+}
+
+#[derive(Clone)]
+pub struct AdmittedSession {
+    pub target_session_id: TargetSessionId,
+    pub approved: Arc<ApprovedTarget<TargetKubernetesOptions>>,
+    pub upstream_certificate_cache: EphemeralKubernetesIdentityCache,
+    ticket_grant: bool,
+}
+
+impl AdmittedSession {
+    pub async fn verify_current(
+        &self,
+        authentication: &KubernetesAuthentication,
+        services: &Services,
+    ) -> poem::Result<()> {
+        if !self.ticket_grant {
+            return Ok(());
+        }
+        let Some(user) = authentication.oidc_user() else {
+            return Err(unauthorized());
+        };
+
+        if warpgate_core::has_active_self_service_ticket(
+            &services.db,
+            user.id,
+            self.approved.target().id,
+        )
+        .await?
+        {
+            Ok(())
+        } else {
+            Err(access_denied(&self.approved.target().name))
+        }
+    }
 }
 
 /// The outcome of the request that opened one correlated session. Requests that
@@ -33,7 +70,7 @@ enum Authorization {
     /// opening request that was dropped mid-approval.
     #[default]
     Pending,
-    Authorized(KubernetesTargetAuthorization),
+    Authorized(AdmittedSession),
     Denied,
 }
 
@@ -59,7 +96,7 @@ pub struct RequestCorrelator {
 /// The session is correlated *before* its authorization is known, so the rest of
 /// the command's fan-out joins this attempt and waits for its single web
 /// approval. The session is registered up front for the same reason: a cluster
-/// peer can then resolve this node as the session's owner (via the `sessions`
+/// peer can then resolve this node as the session's owner (via `user_sessions`
 /// table) and route a pending approval back here.
 pub async fn correlated_authorization(
     correlator: &Arc<Mutex<RequestCorrelator>>,
@@ -67,10 +104,7 @@ pub async fn correlated_authorization(
     authentication: &KubernetesAuthentication,
     target_name: &str,
     services: &Services,
-) -> poem::Result<(
-    Arc<Mutex<WarpgateServerHandle>>,
-    KubernetesTargetAuthorization,
-)> {
+) -> poem::Result<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession)> {
     let user_info = authentication.user_info();
     let key = correlation_key_for_request(
         request,
@@ -97,7 +131,7 @@ pub async fn correlated_authorization(
         // requests don't serialise on its database insert. A handle that then
         // loses the race below is dropped, deleting the session it just opened.
         let handle = register_pending_session(services, request, &user_info).await?;
-        let session_id = handle.lock().await.id();
+        let session_id = handle.lock().await.user_session_id();
 
         let slot = SharedAuthorization::default();
         let claimed = {
@@ -134,9 +168,30 @@ pub async fn correlated_authorization(
         .await
         {
             Ok(resolved) => {
+                let (resolved, ticket_grant, upstream_certificate_cache) = resolved.into_parts();
+                let admitted = match handle
+                    .lock()
+                    .await
+                    .start_target_session(resolved)
+                    .await
+                    .and_then(TargetSessionStart::admitted)
+                {
+                    Ok((target_session_id, approved)) => AdmittedSession {
+                        target_session_id,
+                        approved: Arc::new(approved),
+                        upstream_certificate_cache,
+                        ticket_grant,
+                    },
+                    Err(error) => {
+                        *authorization = Authorization::Denied;
+                        correlator.lock().await.evict(&key, &slot);
+                        settle_failed_attempt(services, &handle, session_id).await;
+                        return Err(error.into());
+                    }
+                };
                 handle.lock().await.confirm();
-                *authorization = Authorization::Authorized(resolved.clone());
-                Ok((handle, resolved))
+                *authorization = Authorization::Authorized(admitted.clone());
+                Ok((handle, admitted))
             }
             Err(error) => {
                 // A denied attempt is not cached: the requests waiting on this
@@ -164,20 +219,15 @@ async fn join_session(
     handle: Arc<Mutex<WarpgateServerHandle>>,
     slot: SharedAuthorization,
     services: &Services,
-) -> poem::Result<
-    Option<(
-        Arc<Mutex<WarpgateServerHandle>>,
-        KubernetesTargetAuthorization,
-    )>,
-> {
+) -> poem::Result<Option<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession)>> {
     // Cloned out so the slot lock is not held while taking the correlator lock.
     let outcome = slot.lock().await.clone();
     match outcome {
-        Authorization::Authorized(authorization) => Ok(Some((handle, authorization))),
+        Authorization::Authorized(admitted) => Ok(Some((handle, admitted))),
         Authorization::Denied => Err(unauthorized()),
         Authorization::Pending => {
             correlator.lock().await.evict(key, &slot);
-            let session_id = handle.lock().await.id();
+            let session_id = handle.lock().await.user_session_id();
             services.auth_state_store.lock().await.remove(&session_id);
             Ok(None)
         }
@@ -195,7 +245,7 @@ async fn join_session(
 async fn settle_failed_attempt(
     services: &Services,
     handle: &Arc<Mutex<WarpgateServerHandle>>,
-    session_id: SessionId,
+    session_id: UserSessionId,
 ) {
     let state = {
         let mut store = services.auth_state_store.lock().await;
@@ -223,10 +273,10 @@ async fn register_pending_session(
     user_info: &AuthStateUserInfo,
 ) -> Result<Arc<Mutex<WarpgateServerHandle>>, WarpgateError> {
     let ip = get_client_ip(request, services).await;
-    let handle = State::register_session(
+    let handle = State::register_node_local_user_session(
         &services.state,
         crate::PROTOCOL_NAME,
-        SessionStateInit {
+        UserSessionStateInit {
             remote_address: ip.and_then(|x| x.parse().ok()),
             handle: Box::new(KubernetesSessionHandle),
         },

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -7,9 +6,8 @@ use bytes::Bytes;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
 use url::Url;
-use warpgate_common::SessionId;
+use warpgate_common::TargetSessionId;
 use warpgate_core::recordings::{
     NDJsonRecordingWriter, Recorder, RecordingWriterOpener, SessionRecordings, TerminalRecorder,
 };
@@ -104,14 +102,13 @@ pub enum SessionRecordingMetadata {
 static API_RECORDING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub async fn start_recording_api(
-    session_id: &SessionId,
-    recordings: &Arc<Mutex<SessionRecordings>>,
+    target_session_id: &TargetSessionId,
+    recordings: &SessionRecordings,
 ) -> anyhow::Result<KubernetesRecorder> {
     let seq = API_RECORDING_SEQ.fetch_add(1, Ordering::Relaxed);
-    let recordings = recordings.lock().await;
     recordings
         .start::<KubernetesRecorder, _>(
-            session_id,
+            target_session_id,
             Some(format!("api-{seq}")),
             SessionRecordingMetadata::Api,
         )
@@ -120,13 +117,12 @@ pub async fn start_recording_api(
 }
 
 pub async fn start_recording_exec(
-    session_id: &SessionId,
-    recordings: &Arc<Mutex<SessionRecordings>>,
+    target_session_id: &TargetSessionId,
+    recordings: &SessionRecordings,
     metadata: SessionRecordingMetadata,
 ) -> anyhow::Result<TerminalRecorder> {
-    let recordings = recordings.lock().await;
     recordings
-        .start::<TerminalRecorder, _>(session_id, None, metadata)
+        .start::<TerminalRecorder, _>(target_session_id, None, metadata)
         .await
         .context("starting recording")
 }

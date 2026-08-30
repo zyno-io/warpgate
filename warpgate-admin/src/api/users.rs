@@ -709,6 +709,8 @@ impl RolesApi {
         role_id: Path<Uuid>,
         body: Json<UpdateUserRoleRequest>,
     ) -> Result<UpdateUserRoleResponse, WarpgateError> {
+        admin.require(AdminPermission::AccessRolesAssign)?;
+
         let db = &admin.services().db;
 
         let Some(role) = Role::Entity::find_by_id(role_id.0).one(db).await? else {
@@ -801,7 +803,6 @@ impl RolesApi {
         let values = warpgate_db_entities::UserAdminRoleAssignment::ActiveModel {
             user_id: Set(id.0),
             admin_role_id: Set(role_id.0),
-            ..Default::default()
         };
 
         values.insert(db).await.map_err(WarpgateError::from)?;

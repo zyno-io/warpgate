@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use tokio::sync::{Mutex, mpsc};
+use bytes::Bytes;
+use futures::stream::{FuturesOrdered, StreamExt};
+use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info_span, warn};
-use uuid::Uuid;
-use warpgate_common::{TargetOptions, WarpgateError};
+use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
 use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata};
-use warpgate_core::{DesktopEvent, Services, SessionStateInit, State, TargetAuthorization};
+use warpgate_core::{DesktopEvent, Services, State, TargetAuthorization, UserSessionStateInit};
 use warpgate_db_entities::Target::TargetKind;
 use warpgate_web_clients_common::{ClientManager, SessionRemover, WebSessionHandle};
 
@@ -30,7 +32,7 @@ impl std::ops::Deref for WebDesktopClientManager {
 }
 
 impl SessionRemover for WebDesktopClientManager {
-    async fn remove_session(&self, id: Uuid) {
+    async fn remove_session(&self, id: UserSessionId) {
         self.0.remove_session(id).await;
     }
 }
@@ -46,16 +48,16 @@ impl WebDesktopClientManager {
         authorization: TargetAuthorization,
         remote_address: Option<SocketAddr>,
         size: Option<(u16, u16)>,
-    ) -> Result<Uuid, WarpgateError> {
+    ) -> Result<UserSessionId, WarpgateError> {
         let user_id = authorization.user_info().id;
         if self.count_for_user(user_id).await >= MAX_SESSIONS_PER_USER {
             return Err(WarpgateError::SessionLimitReached);
         }
 
-        let (user_info, target) = authorization.into_parts();
-        let username = user_info.username.clone();
-
-        let protocol_name = match &target.options {
+        let username = authorization.user_info().username.clone();
+        let target_name = authorization.target().name.clone();
+        let target_kind = TargetKind::from(&authorization.target().options);
+        let protocol_name = match &authorization.target().options {
             TargetOptions::Vnc(_) => warpgate_protocol_vnc::PROTOCOL_NAME,
             TargetOptions::Rdp(_) => warpgate_protocol_rdp::PROTOCOL_NAME,
             _ => return Err(WarpgateError::InvalidTarget),
@@ -64,10 +66,10 @@ impl WebDesktopClientManager {
         let (handle_abort_tx, mut handle_abort_rx) = mpsc::unbounded_channel::<()>();
         let session_handle = WebSessionHandle::new(handle_abort_tx);
 
-        let server_handle = State::register_session(
+        let server_handle = State::register_node_local_user_session(
             &services.state,
             protocol_name,
-            SessionStateInit {
+            UserSessionStateInit {
                 remote_address,
                 handle: Box::new(session_handle),
             },
@@ -75,39 +77,34 @@ impl WebDesktopClientManager {
         .await
         .context("registering web-desktop session")?;
 
-        {
-            let server_handle = server_handle.lock().await;
-            server_handle
-                .set_user_info(user_info)
-                .await
-                .context("setting user info on server handle")?;
-            server_handle
-                .set_target(&target)
-                .await
-                .context("setting target on server handle")?;
-        }
+        let (target_session_id, approved) = server_handle
+            .lock()
+            .await
+            .start_target_session(authorization)
+            .await
+            .context("starting target session")?
+            .admitted()?;
 
-        let session_id = server_handle.lock().await.id();
-        let target_kind = TargetKind::from(&target.options);
+        let session_id = server_handle.lock().await.user_session_id();
 
         // Each backend exposes the same (event_rx, input_tx, abort_tx) handle shape
         // over the shared DesktopEvent/DesktopInput types. The trailing flag asks the
         // event loop to re-encode raw tiles as JPEG for the browser.
-        let (event_rx, input_tx, abort_tx, encode_jpeg) = match target.options.clone() {
-            TargetOptions::Vnc(options) => {
-                let h = warpgate_protocol_vnc::connect(options);
+        let (event_rx, input_tx, abort_tx, encode_jpeg) = match target_kind {
+            TargetKind::Vnc => {
+                let h = warpgate_protocol_vnc::connect(approved.narrow()?)?;
                 // Tight already picks JPEG for photographic tiles and keeps text and UI
                 // lossless, so re-encoding what it deliberately sent as raw would only
                 // degrade it.
                 (h.event_rx, h.input_tx, h.abort_tx, false)
             }
-            TargetOptions::Rdp(options) => {
+            TargetKind::Rdp => {
                 // Connect at the viewer's measured size when known, so the desktop fits the
                 // browser from the first frame; the DVC resize path handles later changes.
                 let h = warpgate_protocol_rdp::connect(
-                    options,
+                    approved.narrow()?,
                     size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
-                );
+                )?;
                 // The RDP helper only ever emits raw RGBA.
                 (h.event_rx, h.input_tx, h.abort_tx, true)
             }
@@ -119,9 +116,7 @@ impl WebDesktopClientManager {
         // which records framebuffer updates; the recording finalises when both drop.
         let recorder: Option<Arc<DesktopRecorder>> = match services
             .recordings
-            .lock()
-            .await
-            .start::<DesktopRecorder, _>(&session_id, None, DesktopRecordingMetadata::Desktop)
+            .start::<DesktopRecorder, _>(&target_session_id, None, DesktopRecordingMetadata::Desktop)
             .await
         {
             Ok(recorder) => Some(Arc::new(recorder)),
@@ -135,7 +130,7 @@ impl WebDesktopClientManager {
         let session = Arc::new(WebDesktopSession::new(
             session_id,
             user_id,
-            target.name.clone(),
+            target_name.clone(),
             target_kind,
             server_handle,
             input_tx,
@@ -164,36 +159,63 @@ impl WebDesktopClientManager {
         spawn_event_loop(
             session.clone(),
             event_rx,
-            self.sessions(),
+            self.0.clone(),
             recorder,
             encode_jpeg,
         );
 
-        debug!(session=%session_id, user=%username, target=%target.name, "Web-desktop session created");
+        debug!(session=%session_id, user=%username, target=%target_name, "Web-desktop session created");
 
         Ok(session_id)
     }
 }
 
 /// Record an event, then send it. Both the live stream and refinements go out this way, so
-/// a recording plays back at the same progressive quality the viewer saw.
+/// a recording plays back at the same progressive quality the viewer saw. `raw` carries a
+/// re-encoded tile's original pixels, letting the recorder composite without a decode.
 async fn emit(
     session: &WebDesktopSession,
     recorder: Option<&DesktopRecorder>,
     event: DesktopEvent,
+    raw: Option<&Bytes>,
 ) {
-    if let Some(recorder) = recorder
-        && let Err(error) = recorder.write_event(&event).await
-    {
-        warn!(%error, "Failed to record desktop event");
+    if let Some(recorder) = recorder {
+        let result = match (&event, raw) {
+            (DesktopEvent::JpegImage { rect, data }, Some(raw)) => {
+                recorder.write_jpeg_with_raw(*rect, data, raw).await
+            }
+            _ => recorder.write_event(&event).await,
+        };
+        if let Err(error) = result {
+            warn!(%error, "Failed to record desktop event");
+        }
     }
     session.push(ServerMessage::from(event)).await;
+}
+
+/// How many events may sit between receipt and emission. Tiles inside this window JPEG-
+/// encode concurrently on the blocking pool while emission stays in arrival order; past
+/// it, receiving pauses so a slow encoder or recorder backpressures the backend.
+const MAX_PIPELINED_EVENTS: usize = 8;
+
+/// An event ready to emit, with the original pixels of a re-encoded tile (see [`emit`]).
+type PreparedEvent = (DesktopEvent, Option<Bytes>);
+
+fn prepare(
+    event: DesktopEvent,
+    encode_jpeg: bool,
+) -> Pin<Box<dyn Future<Output = PreparedEvent> + Send>> {
+    if encode_jpeg {
+        Box::pin(crate::jpeg::encode_raw_images(event))
+    } else {
+        Box::pin(std::future::ready((event, None)))
+    }
 }
 
 fn spawn_event_loop(
     session: Arc<WebDesktopSession>,
     mut event_rx: mpsc::Receiver<warpgate_core::DesktopEvent>,
-    sessions: Arc<Mutex<HashMap<Uuid, Arc<WebDesktopSession>>>>,
+    manager: ClientManager<WebDesktopSession>,
     recorder: Option<Arc<DesktopRecorder>>,
     encode_jpeg: bool,
 ) {
@@ -203,7 +225,14 @@ fn spawn_event_loop(
         async move {
             // Only the JPEG path loses detail, so only it has anything to refine.
             let mut dirty = DirtyTracker::new();
+            // Events between receipt and emission. Composited immediately, JPEG-encoded
+            // concurrently, emitted strictly in arrival order.
+            let mut pipeline: FuturesOrdered<_> = FuturesOrdered::new();
+            let mut backend_done = false;
             loop {
+                if backend_done && pipeline.is_empty() {
+                    break;
+                }
                 // No pending regions means nothing to wake up for; park on the far future
                 // rather than spinning, and let an incoming event arm the timer.
                 let next_due = dirty.next_due();
@@ -215,20 +244,19 @@ fn spawn_event_loop(
                 };
 
                 tokio::select! {
-                    event = event_rx.recv() => {
-                        let Some(event) = event else { break };
+                    event = event_rx.recv(), if !backend_done && pipeline.len() < MAX_PIPELINED_EVENTS => {
+                        let Some(event) = event else {
+                            backend_done = true;
+                            continue;
+                        };
                         // Composite before any re-encoding, so this is a plain blit rather
                         // than a JPEG decode round-trip. Gives a viewer attaching later a
                         // base image, and is the source the refinement reads back from.
                         session.composite(&event).await;
-
                         // Ahead of the recorder, so recordings shrink along with the wire.
-                        let event = if encode_jpeg {
-                            crate::jpeg::encode_raw_images(event).await
-                        } else {
-                            event
-                        };
-
+                        pipeline.push_back(prepare(event, encode_jpeg));
+                    }
+                    Some((event, raw)) = pipeline.next(), if !pipeline.is_empty() => {
                         match &event {
                             DesktopEvent::Resize { width, height } => {
                                 dirty.resize(*width, *height);
@@ -238,14 +266,18 @@ fn spawn_event_loop(
                             }
                             _ => {}
                         }
-                        emit(&session, recorder.as_deref(), event).await;
+                        emit(&session, recorder.as_deref(), event, raw.as_ref()).await;
                     }
-                    () = refine => {
+                    // Gated on an empty pipeline: a refinement snapshots the composited
+                    // surface, which is ahead of anything still awaiting emission — sent
+                    // sooner, its newer pixels would be overwritten by the older tiles
+                    // behind it.
+                    () = refine, if pipeline.is_empty() => {
                         for rect in dirty.take_settled(Instant::now()) {
                             match session.refinement(rect).await {
                                 Some(event) => {
                                     debug!(?rect, "Refining settled region");
-                                    emit(&session, recorder.as_deref(), event).await;
+                                    emit(&session, recorder.as_deref(), event, None).await;
                                 }
                                 // The region left the surface (resize)
                                 // or failed to encode
@@ -257,7 +289,7 @@ fn spawn_event_loop(
             }
             // Backend ended; dropping `recorder` here finalises the recording.
             session.close();
-            sessions.lock().await.remove(&session_id);
+            manager.remove_session(session_id).await;
         }
         .instrument(span),
     );

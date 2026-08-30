@@ -24,7 +24,7 @@ use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::InclusiveRectangle;
-use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::pdu::rdp::headers::ShareDataPdu;
 use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
@@ -35,7 +35,7 @@ use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{debug, warn};
-use warpgate_common::{RdpTargetAuth, TargetRdpOptions};
+use warpgate_common::{RdpTargetAuth, RdpTargetCompression, TargetRdpOptions};
 use warpgate_core::{DesktopEvent, DesktopInput, DesktopRect, DesktopState};
 
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
@@ -99,7 +99,7 @@ pub async fn run(
     );
 
     let (clipboard_tx, clipboard_rx) = unbounded_channel();
-    let clipboard = Clipboard::new(ClientClipboardSink(clipboard_tx));
+    let clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
 
     let (connection_result, framed) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
@@ -608,6 +608,11 @@ fn build_config(
     width: u16,
     height: u16,
 ) -> connector::Config {
+    let (codec_overrides, lossy_compression): (&[&str], bool) =
+        match options.compression.unwrap_or_default() {
+            RdpTargetCompression::RemoteFX => (&[], true),
+            RdpTargetCompression::Lossless => (&["remotefx:off"], false),
+        };
     connector::Config {
         credentials: Credentials::UsernamePassword {
             username: options.username.clone(),
@@ -623,7 +628,18 @@ fn build_config(
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize { width, height },
-        bitmap: None,
+        // The default codec set advertises RemoteFX; `lossy_compression` additionally lets
+        // the target use dynamic color fidelity / subsampling on legacy bitmap updates,
+        // like desktop clients do. A `lossless` target advertises neither, so it sends
+        // losslessly-compressed 32bpp bitmap updates instead. (`client_codecs_capabilities`
+        // never fails for these inputs; `None` would just drop the flags.)
+        bitmap: client_codecs_capabilities(codec_overrides)
+            .ok()
+            .map(|codecs| connector::BitmapConfig {
+                lossy_compression,
+                color_depth: 32,
+                codecs,
+            }),
         client_build: 0,
         client_name: "warpgate".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),

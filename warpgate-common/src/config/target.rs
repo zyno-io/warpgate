@@ -11,7 +11,7 @@ use super::defaults::{
     _default_ssh_port, _default_username, _default_vnc_port,
 };
 use crate::encryption::EncryptionError;
-use crate::{Secret, StoredSecret};
+use crate::{Protocol, Secret, StoredSecret};
 
 pub const KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS: u32 = 5 * 60;
 pub const KUBERNETES_EPHEMERAL_CERTIFICATE_MIN_VALIDITY_SECONDS: u32 = 60;
@@ -297,6 +297,17 @@ impl Default for VncTargetAuth {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Enum, Default)]
+pub enum RdpTargetCompression {
+    #[default]
+    #[serde(rename = "remotefx")]
+    #[oai(rename = "remotefx")]
+    RemoteFX,
+    #[serde(rename = "lossless")]
+    #[oai(rename = "lossless")]
+    Lossless,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
 pub struct TargetRdpOptions {
     #[serde(default = "_default_empty_string")]
@@ -318,6 +329,9 @@ pub struct TargetRdpOptions {
     /// RDP servers commonly use self-signed certificates, so this is off by default.
     #[serde(default)]
     pub verify_tls: bool,
+
+    #[serde(default)]
+    pub compression: Option<RdpTargetCompression>,
 
     // TLS compatibility/security profile used for the target-facing RDP connection.
     // Kept as a plain comment so OpenAPI emits a direct enum reference. A field
@@ -493,6 +507,37 @@ pub enum TargetOptions {
     Vnc(TargetVncOptions),
     #[serde(rename = "rdp")]
     Rdp(TargetRdpOptions),
+}
+
+impl TargetOptions {
+    pub fn protocol(&self) -> Protocol {
+        match self {
+            TargetOptions::Ssh(_) => Protocol::Ssh,
+            TargetOptions::Http(_) => Protocol::Http,
+            TargetOptions::Kubernetes(_) => Protocol::Kubernetes,
+            TargetOptions::MySql(_) => Protocol::MySql,
+            TargetOptions::Postgres(_) => Protocol::Postgres,
+            TargetOptions::Vnc(_) => Protocol::Vnc,
+            TargetOptions::Rdp(_) => Protocol::Rdp,
+        }
+    }
+
+    // both used for connection instructions
+
+    pub fn external_host(&self) -> Option<&str> {
+        match self {
+            Self::Http(options) => options.external_host.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn default_database_name(&self) -> Option<&str> {
+        match self {
+            Self::MySql(options) => options.default_database_name.as_deref(),
+            Self::Postgres(options) => options.default_database_name.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// JSON path towards every possible credential within *serialized* TargetOptions
