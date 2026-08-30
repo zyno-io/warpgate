@@ -109,7 +109,8 @@ export const protocolInfo: Partial<Record<TargetKind, string>> = {
     [TargetKind.Kubernetes]: `
 ## Warpgate ↔ target
 
-* Authenticates to the cluster with a client certificate (mTLS), a bearer token, or an IAM role (EKS token).
+* Authenticates to the cluster with a client certificate (mTLS), a bearer token, an IAM role (EKS token), or a short-lived client certificate signed by the Warpgate instance CA.
+* Ephemeral certificates identify the user as \`warpgate:<username>\` and place them in the target-specific \`warpgate:target:<target-id>\` Kubernetes group. Install the instance CA certificate in the API server's client-CA bundle and bind that group to Kubernetes RBAC before enabling the auth mode.
 * TLS at target is optional.
 
 ## Warpgate ↔ client

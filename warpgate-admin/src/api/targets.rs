@@ -33,6 +33,13 @@ fn serialize_options_for_storage(
     Ok(value)
 }
 
+fn validate_target_options(options: &TargetOptions) -> Result<(), String> {
+    if let TargetOptions::Kubernetes(options) = options {
+        options.validate()?;
+    }
+    Ok(())
+}
+
 #[derive(Object)]
 struct TargetDataRequest {
     name: String,
@@ -125,6 +132,9 @@ impl ListApi {
 
         if body.name.is_empty() {
             return Ok(CreateTargetResponse::BadRequest(Json("name".into())));
+        }
+        if let Err(error) = validate_target_options(&body.options) {
+            return Ok(CreateTargetResponse::BadRequest(Json(error)));
         }
 
         let db = &admin.services().db;
@@ -236,6 +246,9 @@ impl DetailApi {
         };
 
         if target.kind != (&body.options).into() {
+            return Ok(UpdateTargetResponse::BadRequest);
+        }
+        if validate_target_options(&body.options).is_err() {
             return Ok(UpdateTargetResponse::BadRequest);
         }
 

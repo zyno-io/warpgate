@@ -25,7 +25,9 @@ use warpgate_core::recordings::{TerminalRecorder, TerminalRecordingStreamId};
 
 use crate::correlator::{RequestCorrelator, correlated_authorization};
 use crate::recording::{deduce_exec_recording_metadata, start_recording_api, start_recording_exec};
-use crate::server::auth::{authenticate_kubernetes_user, create_authenticated_client};
+use crate::server::auth::{
+    EphemeralKubernetesIdentityCache, authenticate_kubernetes_user, create_authenticated_client,
+};
 
 /// A client-supplied impersonation header (`Impersonate-User`,
 /// `Impersonate-Group`, `Impersonate-Uid`, `Impersonate-Extra-*`). These let a
@@ -106,7 +108,8 @@ pub async fn handle_api_request(
         .verify_current(&authentication, ctx.services())
         .await?;
 
-    let (user_info, target) = authorization.into_parts();
+    let (user_info, target, upstream_certificate_cache) = authorization.into_parts();
+    let target_id = target.id;
 
     let TargetOptions::Kubernetes(k8s_options) = &target.options else {
         return Err(poem::Error::from_string(
@@ -134,6 +137,8 @@ pub async fn handle_api_request(
                 k8s_options,
                 &path,
                 user_info,
+                target_id,
+                &upstream_certificate_cache,
                 session_id,
                 ctx.services(),
             )
@@ -146,6 +151,8 @@ pub async fn handle_api_request(
                 k8s_options,
                 &path,
                 user_info,
+                target_id,
+                &upstream_certificate_cache,
                 session_id,
                 ctx.services(),
             )
@@ -179,13 +186,21 @@ async fn _handle_normal_request_inner(
     k8s_options: &TargetKubernetesOptions,
     path: &str,
     user_info: AuthStateUserInfo,
+    target_id: uuid::Uuid,
+    upstream_certificate_cache: &EphemeralKubernetesIdentityCache,
     session_id: SessionId,
     services: &Services,
 ) -> Result<Response, WarpgateError> {
-    let client = create_authenticated_client(k8s_options, Some(&user_info.username), services)
-        .await?
-        .build()
-        .context("building reqwest client")?;
+    let client = create_authenticated_client(
+        k8s_options,
+        &user_info,
+        target_id,
+        upstream_certificate_cache,
+        services,
+    )
+    .await?
+    .build()
+    .context("building reqwest client")?;
 
     debug!(
         "Target Kubernetes options: cluster_url={}, auth={:?}",
@@ -194,6 +209,9 @@ async fn _handle_normal_request_inner(
             warpgate_common::KubernetesTargetAuth::Token(_) => "Token",
             warpgate_common::KubernetesTargetAuth::Certificate(_) => "Certificate",
             warpgate_common::KubernetesTargetAuth::IamRole(_) => "IamRole",
+            warpgate_common::KubernetesTargetAuth::EphemeralCertificate(_) => {
+                "EphemeralCertificate"
+            }
         }
     );
 
@@ -434,6 +452,8 @@ async fn _handle_websocket_request_inner(
     k8s_options: &TargetKubernetesOptions,
     path: &str,
     user_info: AuthStateUserInfo,
+    target_id: uuid::Uuid,
+    upstream_certificate_cache: &EphemeralKubernetesIdentityCache,
     session_id: SessionId,
     services: &Services,
 ) -> anyhow::Result<impl IntoResponse> {
@@ -444,10 +464,16 @@ async fn _handle_websocket_request_inner(
         let _ = full_url.set_scheme("ws");
     }
 
-    let client = create_authenticated_client(k8s_options, Some(&user_info.username), services)
-        .await?
-        .http1_only()
-        .build()?;
+    let client = create_authenticated_client(
+        k8s_options,
+        &user_info,
+        target_id,
+        upstream_certificate_cache,
+        services,
+    )
+    .await?
+    .http1_only()
+    .build()?;
 
     let (recorder_tx, recorder_rx) = mpsc::channel::<Vec<u8>>(1000);
     {

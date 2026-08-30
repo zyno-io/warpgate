@@ -87,6 +87,32 @@
         }
     }
 
+    function setKubernetesAuth(event: Event) {
+        if (!target || target.options.kind !== 'Kubernetes') return
+
+        switch ((event.currentTarget as HTMLSelectElement).value) {
+            case 'Certificate':
+                target.options.auth = {
+                    kind: 'Certificate',
+                    certificate: '',
+                    privateKey: '',
+                }
+                break
+            case 'Token':
+                target.options.auth = { kind: 'Token', token: '' }
+                break
+            case 'EphemeralCertificate':
+                target.options.auth = {
+                    kind: 'EphemeralCertificate',
+                    validitySeconds: 300,
+                }
+                break
+            case 'IamRole':
+                target.options.auth = { kind: 'IamRole' }
+                break
+        }
+    }
+
     async function remove() {
         if (!target) return
         if (confirm(`Delete target ${target.name}?`)) {
@@ -369,12 +395,16 @@
                             <FormGroup floating label="Auth Type">
                                 <select
                                     class="form-control"
-                                    bind:value={target.options.auth.kind}
+                                    value={target.options.auth.kind}
+                                    onchange={setKubernetesAuth}
                                 >
                                     <option value="Certificate">
                                         Certificate
                                     </option>
                                     <option value="Token">Token</option>
+                                    <option value="EphemeralCertificate">
+                                        Ephemeral client certificate
+                                    </option>
                                     {#if $serverInfo?.runningOnEc2}
                                         <option value="IamRole">
                                             IAM Role (experimental)
@@ -410,6 +440,31 @@
                                         autocomplete="off"
                                         bind:value={target.options.auth.token}
                                     >
+                                </FormGroup>
+                            {/if}
+
+                            {#if target.options.auth.kind === 'EphemeralCertificate'}
+                                <Alert color="info">
+                                    Warpgate signs a short-lived client certificate for each
+                                    active session. Before enabling this target, install the
+                                    instance CA certificate in the Kubernetes API server's
+                                    client-CA trust bundle and bind
+                                    <code>warpgate:target:{target.id}</code> to the required
+                                    Kubernetes RBAC role.
+                                </Alert>
+                                <FormGroup floating label="Certificate validity (seconds)">
+                                    <input
+                                        class="form-control"
+                                        type="number"
+                                        min="60"
+                                        max="600"
+                                        bind:value={target.options.auth.validitySeconds}
+                                    >
+                                    <small class="form-text text-muted">
+                                        60–600 seconds; 300 seconds by default. Kubernetes
+                                        audit records the user as
+                                        <code>warpgate:&lt;username&gt;</code>.
+                                    </small>
                                 </FormGroup>
                             {/if}
 

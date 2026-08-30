@@ -792,6 +792,96 @@ class TestKubernetesIntegration:
         assert p.returncode == 0, "mtls upstream token-user combo failed"
 
     @pytest.mark.asyncio
+    async def test_ephemeral_client_certificate_upstream(
+        self, processes, shared_wg: WarpgateProcess
+    ):
+        """Warpgate can mint a trusted client certificate for each K8s session."""
+        k3s: K3sInstance = processes.start_k3s()
+        url = f"https://localhost:{shared_wg.http_port}"
+
+        with admin_client(url) as api:
+            role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid.uuid4()}"))
+            user = api.create_user(
+                sdk.CreateUserRequest(username=f"user-{uuid.uuid4()}")
+            )
+            api.create_password_credential(
+                user.id, sdk.NewPasswordCredential(password="123")
+            )
+            api.add_user_role(user.id, role.id)
+
+            instance_ca = api.get_instance_ca_certificate()
+            k3s.trust_client_ca(instance_ca.certificate_pem)
+
+            target_name = f"k8s-ephemeral-cert-{uuid.uuid4()}"
+            target = api.create_target(
+                sdk.TargetDataRequest(
+                    name=target_name,
+                    options=sdk.TargetOptions(
+                        sdk.TargetOptionsTargetKubernetesOptions(
+                            kind="Kubernetes",
+                            cluster_url=f"https://127.0.0.1:{k3s.port}",
+                            tls=sdk.Tls(mode=sdk.TlsMode.PREFERRED, verify=False),
+                            auth=sdk.KubernetesTargetAuth(
+                                sdk.KubernetesTargetAuthKubernetesTargetEphemeralCertificateAuth(
+                                    kind="EphemeralCertificate",
+                                    validity_seconds=60,
+                                )
+                            ),
+                        )
+                    ),
+                )
+            )
+            api.add_target_role(target.id, role.id)
+
+        k3s.kubectl(
+            [
+                "create",
+                "clusterrolebinding",
+                f"warpgate-target-{target.id}",
+                "--clusterrole=cluster-admin",
+                f"--group=warpgate:target:{target.id}",
+            ]
+        )
+
+        user_token = create_api_token(url, user.username, "123")
+        server = f"https://127.0.0.1:{shared_wg.kubernetes_port}/{target_name}"
+        request = [
+            "kubectl",
+            "get",
+            "pods",
+            "--server",
+            server,
+            "--insecure-skip-tls-verify",
+            "--token",
+            user_token,
+            "-n",
+            "default",
+        ]
+
+        # Kube-apiserver reloads client-CA bundles asynchronously. Retry only
+        # while that one-time trust-bundle update becomes active.
+        for _ in range(30):
+            p = run_kubectl(request)
+            if p.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail(
+                "ephemeral upstream client certificate was not accepted by k3s:\n"
+                + p.stderr.decode()
+            )
+
+        # The session cache renews with a 15-second safety margin, so this
+        # request necessarily uses a second certificate instead of the
+        # initial 60-second credential.
+        time.sleep(61)
+        p = run_kubectl(request)
+        assert p.returncode == 0, (
+            "ephemeral upstream client certificate did not renew after expiry:\n"
+            + p.stderr.decode()
+        )
+
+    @pytest.mark.asyncio
     async def test_kubectl_exec_io(self, processes, shared_wg: WarpgateProcess):
         """Verify that ``kubectl exec`` through Warpgate proxies stdin/stdout."""
         k3s: K3sInstance = processes.start_k3s()
