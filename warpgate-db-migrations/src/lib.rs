@@ -81,6 +81,8 @@ mod m00074_encryption_key_rotation;
 mod m00075_hash_ticket_and_api_token_secrets;
 mod m00076_open_targets_in_new_tab;
 mod m00077_session_user_target_id;
+#[path = "m00078_fix_credential_policy_publickey.rs"]
+mod legacy_m00078_fix_credential_policy_publickey;
 mod m00078_assignment_composite_pks;
 mod m00079_unique_target_and_group_names;
 mod m00080_user_and_target_sessions;
@@ -173,6 +175,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00075_hash_ticket_and_api_token_secrets::Migration),
             Box::new(m00076_open_targets_in_new_tab::Migration),
             Box::new(m00077_session_user_target_id::Migration),
+            Box::new(legacy_m00078_fix_credential_policy_publickey::Migration),
             Box::new(m00078_assignment_composite_pks::Migration),
             Box::new(m00079_unique_target_and_group_names::Migration),
             Box::new(m00080_user_and_target_sessions::Migration),
@@ -252,4 +255,16 @@ pub async fn migrate_database_down(
     steps: u32,
 ) -> Result<(), DbErr> {
     Migrator::down(connection, Some(steps)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retains_the_legacy_credential_policy_migration_name() {
+        let migration = legacy_m00078_fix_credential_policy_publickey::Migration;
+
+        assert_eq!(migration.name(), "m00078_fix_credential_policy_publickey");
+    }
 }
