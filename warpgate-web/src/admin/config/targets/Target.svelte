@@ -105,6 +105,7 @@
                 target.options.auth = {
                     kind: 'EphemeralCertificate',
                     validitySeconds: 300,
+                    username: undefined,
                 }
                 break
             case 'IamRole':
@@ -448,9 +449,9 @@
                                     Warpgate signs a short-lived client certificate for each
                                     active session. Before enabling this target, install the
                                     instance CA certificate in the Kubernetes API server's
-                                    client-CA trust bundle and bind
-                                    <code>warpgate:target:{target.id}</code> to the required
-                                    Kubernetes RBAC role.
+                                    client-CA trust bundle. Configure a Kubernetes username below
+                                    when target access should use a shared, target-specific RBAC
+                                    identity.
                                 </Alert>
                                 <FormGroup floating label="Certificate validity (seconds)">
                                     <input
@@ -464,6 +465,21 @@
                                         60–600 seconds; 300 seconds by default. Kubernetes
                                         audit records the user as
                                         <code>warpgate:&lt;username&gt;</code>.
+                                    </small>
+                                </FormGroup>
+                                <FormGroup floating label="Kubernetes username (optional)">
+                                    <input
+                                        class="form-control"
+                                        type="text"
+                                        autocomplete="off"
+                                        placeholder="warpgate-operator"
+                                        bind:value={target.options.auth.username}
+                                    >
+                                    <small class="form-text text-muted">
+                                        The certificate CN. If omitted, Kubernetes receives
+                                        <code>warpgate:&lt;username&gt;</code> and the target-ID
+                                        group. Names beginning with <code>system:</code> are
+                                        rejected.
                                     </small>
                                 </FormGroup>
                             {/if}

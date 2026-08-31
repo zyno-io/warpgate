@@ -426,6 +426,12 @@ pub struct KubernetesTargetEphemeralCertificateAuth {
     /// renewed for an active Warpgate session before it expires.
     #[serde(default = "_default_kubernetes_ephemeral_certificate_validity_seconds")]
     pub validity_seconds: u32,
+
+    /// Optional Kubernetes username (certificate subject CN) for every
+    /// upstream connection to this target. When omitted, Warpgate preserves
+    /// the authenticated user's identity as `warpgate:<username>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 fn _default_kubernetes_ephemeral_certificate_validity_seconds() -> u32 {
@@ -436,6 +442,7 @@ impl Default for KubernetesTargetEphemeralCertificateAuth {
     fn default() -> Self {
         Self {
             validity_seconds: KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS,
+            username: None,
         }
     }
 }
@@ -446,6 +453,14 @@ impl KubernetesTargetEphemeralCertificateAuth {
             ..=KUBERNETES_EPHEMERAL_CERTIFICATE_MAX_VALIDITY_SECONDS)
             .contains(&self.validity_seconds)
         {
+            if let Some(username) = &self.username
+                && (username.trim().is_empty() || username.starts_with("system:"))
+            {
+                return Err(
+                    "Kubernetes ephemeral certificate username must be non-empty and must not start with `system:`"
+                        .to_string(),
+                );
+            }
             return Ok(());
         }
 
@@ -633,13 +648,21 @@ mod tests {
 
         let too_short = KubernetesTargetEphemeralCertificateAuth {
             validity_seconds: 59,
+            username: None,
         };
         assert!(too_short.validate().is_err());
 
         let too_long = KubernetesTargetEphemeralCertificateAuth {
             validity_seconds: 601,
+            username: None,
         };
         assert!(too_long.validate().is_err());
+
+        let reserved_username = KubernetesTargetEphemeralCertificateAuth {
+            validity_seconds: 300,
+            username: Some("system:admin".to_string()),
+        };
+        assert!(reserved_username.validate().is_err());
 
         let options = TargetKubernetesOptions {
             cluster_url: "https://kubernetes.example.com".to_string(),

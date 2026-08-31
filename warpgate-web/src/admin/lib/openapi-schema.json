@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate Web Admin",
-    "version": "v0.28.0-29-g183fda93-modified"
+    "version": "v0.28.0-66-g7ec3fcc1-modified"
   },
   "servers": [
     {
@@ -5385,6 +5385,10 @@
             "type": "integer",
             "format": "uint32",
             "description": "Validity of each in-memory upstream certificate. The certificate is\nrenewed for an active Warpgate session before it expires."
+          },
+          "username": {
+            "type": "string",
+            "description": "Optional Kubernetes username (certificate subject CN) for every\nupstream connection to this target. When omitted, Warpgate preserves\nthe authenticated user's identity as `warpgate:<username>`."
           }
         }
       },
