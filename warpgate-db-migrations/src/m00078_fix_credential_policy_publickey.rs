@@ -18,24 +18,24 @@ impl MigrationTrait for Migration {
         match manager.get_database_backend() {
             DbBackend::Postgres => {
                 db.execute_unprepared(
-                    "UPDATE users \\
-                     SET credential_policy = REPLACE(credential_policy::text, '\"public_key\"', '\"publickey\"')::jsonb \\
+                    "UPDATE users \
+                     SET credential_policy = REPLACE(credential_policy::text, '\"public_key\"', '\"publickey\"')::jsonb \
                      WHERE credential_policy::text LIKE '%\"public_key\"%'",
                 )
                 .await?;
             }
             DbBackend::MySql => {
                 db.execute_unprepared(
-                    "UPDATE users \\
-                     SET credential_policy = REPLACE(credential_policy, '\"public_key\"', '\"publickey\"') \\
+                    "UPDATE users \
+                     SET credential_policy = REPLACE(credential_policy, '\"public_key\"', '\"publickey\"') \
                      WHERE CAST(credential_policy AS CHAR) LIKE '%\"public_key\"%'",
                 )
                 .await?;
             }
             DbBackend::Sqlite => {
                 db.execute_unprepared(
-                    "UPDATE users \\
-                     SET credential_policy = REPLACE(credential_policy, '\"public_key\"', '\"publickey\"') \\
+                    "UPDATE users \
+                     SET credential_policy = REPLACE(credential_policy, '\"public_key\"', '\"publickey\"') \
                      WHERE credential_policy LIKE '%\"public_key\"%'",
                 )
                 .await?;
